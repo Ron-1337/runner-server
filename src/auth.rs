@@ -163,7 +163,7 @@ pub fn clear_cookie(secure: bool) -> String {
 pub fn bearer(headers: &HeaderMap) -> Option<String> {
     let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
     let token = value.strip_prefix("Bearer ")?.trim();
-    runner_core::remote::valid_credential(token).then(|| token.to_owned())
+    crate::protocol::valid_credential(token).then(|| token.to_owned())
 }
 
 pub async fn start_session(state: &AppState, user_id: i64) -> anyhow::Result<String> {
@@ -243,7 +243,7 @@ mod tests {
 
     #[test]
     fn codes_and_credentials_match_runner_formats() {
-        assert!(runner_core::remote::valid_credential(&credential()));
+        assert!(crate::protocol::valid_credential(&credential()));
         let code = user_code();
         assert_eq!(
             normalize_user_code(&code.to_lowercase().replace('-', " ")),

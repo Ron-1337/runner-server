@@ -1,3 +1,7 @@
+use crate::protocol::{
+    self, Account, Computer, EnrollmentState, HostInfo, PollRequest, PollResponse, Secret,
+    StartRequest, StartResponse,
+};
 use crate::{AppState, auth, db, now, relay};
 use axum::{
     Json, Router,
@@ -7,12 +11,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::post,
 };
-use base64::{Engine, engine::general_purpose::STANDARD};
 use chrono::{DateTime, SecondsFormat};
-use runner_core::remote::{
-    self, Account, Computer, EnrollmentState, HostInfo, PollRequest, PollResponse, Secret,
-    StartRequest, StartResponse,
-};
 use serde::{Serialize, de::DeserializeOwned};
 
 pub const ENROLLMENT_TTL: i64 = 600;
@@ -106,7 +105,7 @@ pub fn rfc3339(ts: i64) -> Option<String> {
 }
 
 pub fn decode_host_key(key: &str) -> Option<Vec<u8>> {
-    STANDARD.decode(key).ok().filter(|k| k.len() == 32)
+    protocol::decode_key(key)
 }
 
 async fn start(State(state): State<AppState>, body: Bytes) -> RpcResult<StartResponse> {
@@ -231,7 +230,7 @@ async fn poll(State(state): State<AppState>, body: Bytes) -> RpcResult<PollRespo
                                         name: &name,
                                         info: &e.info,
                                         host_key: &e.host_key,
-                                        fingerprint: &remote::fingerprint(&key),
+                                        fingerprint: &protocol::fingerprint(&key),
                                         credential_hash: &auth::sha256_hex(&credential),
                                         claim_expires_at,
                                     },
@@ -349,7 +348,6 @@ async fn list_hosts(State(state): State<AppState>, headers: HeaderMap) -> RpcRes
                     connected_at: connected.map(|t| t.to_rfc3339_opts(SecondsFormat::Secs, true)),
                     last_seen_at: h.last_seen_at.and_then(rfc3339),
                     is_self: h.id == me.id,
-                    paired: false,
                 }
             })
             .collect(),

@@ -1,4 +1,7 @@
-use crate::{AppState, auth, db, now};
+use crate::{
+    AppState, auth, db, now,
+    protocol::{self, Account, CLIENT_SUBPROTOCOL, Control, MAX_FRAME},
+};
 use axum::{
     Router,
     body::Bytes,
@@ -12,10 +15,6 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt, stream::SplitSink};
-use runner_core::{
-    companion::channel::{self, MAX_FRAME},
-    remote::{self, Account, Control},
-};
 use serde::Deserialize;
 use std::{
     collections::HashMap,
@@ -27,7 +26,6 @@ use std::{
 };
 use tokio::{sync::mpsc, time::timeout};
 
-pub const CLIENT_SUBPROTOCOL: &str = "runner-client.v1";
 pub const MAX_QUEUED_BYTES: usize = 1024 * 1024;
 pub const MAX_CHANNELS_PER_HOST: usize = 64;
 const PING_INTERVAL: Duration = Duration::from_secs(25);
@@ -232,7 +230,7 @@ impl Hub {
         };
         if reserve(&source.to_host, bytes.len()) {
             let counter = source.to_host.clone();
-            let framed = channel::wrap(link.channel, bytes);
+            let framed = protocol::wrap(link.channel, bytes);
             let _ = entry.tx.send(HostOut::Binary(framed, counter));
             true
         } else {
@@ -303,23 +301,23 @@ async fn host_upgrade(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
-    if !offers(&headers, remote::SUBPROTOCOL) {
+    if !offers(&headers, protocol::SUBPROTOCOL) {
         return StatusCode::BAD_REQUEST.into_response();
     }
     let (host, user) = match authenticate(&state, &headers).await {
         Ok(found) => found,
         Err(status) => return status.into_response(),
     };
-    ws.protocols([remote::SUBPROTOCOL])
-        .max_message_size(remote::MAX_RELAY_SIZE)
-        .max_frame_size(remote::MAX_RELAY_SIZE)
+    ws.protocols([protocol::SUBPROTOCOL])
+        .max_message_size(protocol::MAX_RELAY_SIZE)
+        .max_frame_size(protocol::MAX_RELAY_SIZE)
         .on_upgrade(move |socket| serve_host(state, socket, host, user))
 }
 
 async fn serve_host(state: AppState, socket: WebSocket, host: db::Host, user: db::User) {
     let (mut sink, mut stream) = socket.split();
     let hello = match timeout(HELLO_TIMEOUT, stream.next()).await {
-        Ok(Some(Ok(Message::Text(text)))) if text.len() <= remote::MAX_CONTROL_SIZE => {
+        Ok(Some(Ok(Message::Text(text)))) if text.len() <= protocol::MAX_CONTROL_SIZE => {
             serde_json::from_str::<Control>(&text).ok()
         }
         _ => None,
@@ -360,12 +358,12 @@ async fn serve_host(state: AppState, socket: WebSocket, host: db::Host, user: db
             _ = &mut writer => break,
             frame = timeout(IDLE_TIMEOUT, stream.next()) => match frame {
                 Ok(Some(Ok(Message::Binary(bytes)))) => {
-                    if let Some((channel, _)) = channel::unwrap(&bytes) {
+                    if let Some((channel, _)) = protocol::unwrap(&bytes) {
                         state.hub.to_client(id, conn, channel, bytes.slice(4..));
                     }
                 }
                 Ok(Some(Ok(Message::Text(text)))) => {
-                    if text.len() <= remote::MAX_CONTROL_SIZE
+                    if text.len() <= protocol::MAX_CONTROL_SIZE
                         && let Ok(Control::CloseChannel { channel }) = serde_json::from_str(&text) {
                             state.hub.close_channel(id, conn, channel);
                         }

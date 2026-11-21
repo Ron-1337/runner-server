@@ -2,6 +2,7 @@ pub mod auth;
 pub mod config;
 pub mod db;
 pub mod html;
+pub mod protocol;
 pub mod relay;
 pub mod rpc;
 pub mod web;

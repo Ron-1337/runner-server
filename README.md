@@ -18,12 +18,25 @@ runner remote login --server https://runner.example.com
 
 ## 构建
 
-依赖 Runner 仓库中的 `runner-core`（协议类型直接复用），默认按同级目录 `../runner` 引用：
+不依赖 Runner 源码。服务用到的协议类型和函数复制在 `src/protocol.rs`，`tests/fixtures/` 是 Runner 自己的报文样例，测试会检查两者一致；Runner 改协议时需要同步这两处。
 
 ```sh
 cargo build --release
 cargo test
 ```
+
+## 下载
+
+GitHub Actions 在每次推送到 `main` 和每个 PR 时运行测试，并编译以下产物（在该次运行的 Artifacts 中下载）：
+
+| 平台 | 目标 |
+| --- | --- |
+| Linux amd64 | `x86_64-unknown-linux-gnu` |
+| Linux arm64 | `aarch64-unknown-linux-gnu` |
+| Windows amd64 | `x86_64-pc-windows-msvc` |
+| macOS arm64 | `aarch64-apple-darwin` |
+
+推送 `v*` 标签（如 `git tag v0.1.0 && git push origin v0.1.0`）会创建 GitHub Release，附带上述压缩包和 `SHA256SUMS`。
 
 ## 运行
 
@@ -97,3 +110,7 @@ location / {
 | `GET /relay/client?host=<id>`（`runner-client.v1`） | 打开一条到同账号电脑的通道，帧原样转发 |
 
 关闭码：4001 同一凭据在别处连接，4003 电脑被移除、账号被停用或删除，4413 通道队列超过 1 MiB，1012 服务重启。服务每 25 秒发送 ping，60 秒无数据断开连接。
+
+## 许可证
+
+MIT，见 [LICENSE](LICENSE)。`src/protocol.rs` 和 `tests/fixtures/` 改编自 Runner（MIT，见 `licenses/runner-LICENSE`）。

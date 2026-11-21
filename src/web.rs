@@ -460,7 +460,7 @@ async fn add_page(
         ));
     };
     let fingerprint = rpc::decode_host_key(&en.host_key)
-        .map(|k| runner_core::remote::fingerprint(&k))
+        .map(|k| crate::protocol::fingerprint(&k))
         .unwrap_or_default();
     Ok(page(
         "批准电脑",

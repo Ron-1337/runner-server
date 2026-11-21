@@ -1,9 +1,6 @@
 use base64::{Engine, engine::general_purpose::STANDARD};
 use futures_util::{SinkExt, StreamExt};
-use runner_core::{
-    companion::channel,
-    remote::{self, EnrollmentState, PollResponse, StartResponse},
-};
+use runner_server::protocol::{self as remote, EnrollmentState, PollResponse, StartResponse};
 use runner_server::{AppState, app, config::Config, db};
 use serde_json::{Value, json};
 use std::time::Duration;
@@ -288,7 +285,10 @@ async fn setup_enroll_and_relay_between_two_computers() {
     );
 
     let route = format!("/relay/client?host={a_id}");
-    let mut client = s.ws(&route, &b_cred, "runner-client.v1").await.unwrap();
+    let mut client = s
+        .ws(&route, &b_cred, remote::CLIENT_SUBPROTOCOL)
+        .await
+        .unwrap();
     let open = text(&mut host_a).await;
     assert_eq!(open["type"], "channelOpen");
     let ch = open["channel"].as_u64().unwrap() as u32;
@@ -296,9 +296,9 @@ async fn setup_enroll_and_relay_between_two_computers() {
         .send(Message::Binary(vec![1, 2, 3].into()))
         .await
         .unwrap();
-    assert_eq!(binary(&mut host_a).await, channel::wrap(ch, &[1, 2, 3]));
+    assert_eq!(binary(&mut host_a).await, remote::wrap(ch, &[1, 2, 3]));
     host_a
-        .send(Message::Binary(channel::wrap(ch, &[9, 9]).into()))
+        .send(Message::Binary(remote::wrap(ch, &[9, 9]).into()))
         .await
         .unwrap();
     assert_eq!(binary(&mut client).await, vec![9, 9]);
@@ -310,7 +310,10 @@ async fn setup_enroll_and_relay_between_two_computers() {
         .unwrap();
     assert_eq!(close_code(&mut client).await, 1000);
 
-    let mut second = s.ws(&route, &b_cred, "runner-client.v1").await.unwrap();
+    let mut second = s
+        .ws(&route, &b_cred, remote::CLIENT_SUBPROTOCOL)
+        .await
+        .unwrap();
     let reopened = text(&mut host_a).await;
     assert_eq!(reopened["type"], "channelOpen");
     second.close(None).await.unwrap();
@@ -415,7 +418,7 @@ async fn users_are_isolated_and_only_admins_manage_users() {
     let (_host_c, _) = s.host(&c_cred).await;
     let route = format!("/relay/client?host={a_id}");
     assert_eq!(
-        refused_status(s.ws(&route, &c_cred, "runner-client.v1").await),
+        refused_status(s.ws(&route, &c_cred, remote::CLIENT_SUBPROTOCOL).await),
         404
     );
     let bobs: Value = s

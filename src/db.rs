@@ -1,5 +1,5 @@
+use crate::protocol::HostInfo;
 use anyhow::Result;
-use runner_core::remote::HostInfo;
 use rusqlite::{Connection, ErrorCode, OptionalExtension, Row, params};
 use std::{
     path::Path,
