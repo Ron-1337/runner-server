@@ -1397,3 +1397,81 @@ async fn the_approval_page_names_the_device() {
     let (_socket, welcome) = s.host(&poll.credential.0).await;
     assert_eq!(welcome["name"], "Desk");
 }
+
+#[tokio::test]
+async fn the_approval_page_returns_to_the_phone_app() {
+    let s = server().await;
+    let jar = std::sync::Arc::new(reqwest::cookie::Jar::default());
+    let admin = reqwest::Client::builder()
+        .cookie_provider(jar.clone())
+        .build()
+        .unwrap();
+    s.setup(&admin).await;
+    // The app's sign-in browser stops at the redirect back to the app.
+    let app_browser = reqwest::Client::builder()
+        .cookie_provider(jar)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let start: StartResponse = s
+        .call(
+            "HostEnrollmentService/StartEnrollment",
+            None,
+            json!({
+                "kind": "ENROLLMENT_KIND_CLIENT",
+                "client": {"name": "Pixel"},
+                "hostKey": STANDARD.encode([7; 32]),
+            }),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    let page = app_browser
+        .get(format!("{}&app=1", start.verification_uri_complete))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(page.contains(r#"name="app" value="1""#), "{page}");
+    let decided = s
+        .form(
+            &app_browser,
+            "/hosts/add",
+            &[
+                ("code", &start.user_code),
+                ("decision", "approve"),
+                ("app", "1"),
+            ],
+        )
+        .await;
+    assert_eq!(decided.status(), reqwest::StatusCode::SEE_OTHER);
+    assert_eq!(
+        decided.headers()["location"],
+        "runner-remote-auth://enrollment?result=approved"
+    );
+    let poll: PollResponse = s
+        .call(
+            "HostEnrollmentService/PollEnrollment",
+            None,
+            json!({"deviceCode": start.device_code.0}),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert!(!poll.credential.0.is_empty());
+
+    // Opened in an ordinary browser, the page keeps no way back to the app.
+    let page = admin
+        .get(format!("{}/hosts/add?code=ABCD-EFGH", s.origin))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(!page.contains(r#"name="app""#));
+}

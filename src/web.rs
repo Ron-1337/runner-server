@@ -439,7 +439,14 @@ async fn rename_host(
 #[derive(Deserialize)]
 struct CodeQuery {
     code: Option<String>,
+    /// `1` when the phone app opened this page in its sign-in browser: the
+    /// decision then returns to the app through [APP_CALLBACK].
+    app: Option<String>,
 }
+
+/// Where the phone app's sign-in browser closes and returns to the app. Fixed,
+/// so the page cannot be made to redirect anywhere else.
+pub const APP_CALLBACK: &str = "runner-remote-auth://enrollment";
 
 fn code_form(user: &db::User, notice: Option<Notice>) -> Response {
     page(
@@ -479,6 +486,7 @@ async fn add_page(
     let fingerprint = rpc::decode_host_key(&en.host_key)
         .map(|k| crate::protocol::fingerprint(&k))
         .unwrap_or_default();
+    let from_app = q.app.as_deref() == Some("1");
     let (noun, title, shown_on) = match en.kind {
         DeviceKind::Computer => ("台电脑", "批准电脑", "电脑终端"),
         DeviceKind::Phone => ("部手机", "批准手机", "手机 App"),
@@ -495,7 +503,7 @@ async fn add_page(
 <tr><th>请求来源</th><td class="mono">{ip}</td></tr>
 <tr><th>有效期至</th><td>{expires}</td></tr></table>
 <p class="muted">请确认代码和指纹与{shown_on}中显示的一致。批准后这{noun}会加入账号 <b>{account}</b>。</p>
-<form method="post" action="/hosts/add"><input type="hidden" name="code" value="{code}">
+<form method="post" action="/hosts/add"><input type="hidden" name="code" value="{code}">{app}
 <label>设备名称</label><input type="text" name="name" value="{name}" maxlength="64" autocomplete="off">
 <p class="row"><button class="primary" name="decision" value="approve">批准</button><button name="decision" value="deny">拒绝</button></p></form></div>"#,
             code = e(&en.user_code),
@@ -508,6 +516,11 @@ async fn add_page(
             ip = e(&en.requesting_ip),
             expires = time(en.expires_at),
             account = e(&me.user.username),
+            app = if from_app {
+                r#"<input type="hidden" name="app" value="1">"#
+            } else {
+                ""
+            },
         ),
     )
     .into_response())
@@ -520,6 +533,8 @@ struct DecisionForm {
     /// The device's name as approved; empty keeps the name it sent.
     #[serde(default)]
     name: String,
+    #[serde(default)]
+    app: String,
 }
 
 async fn add_submit(
@@ -554,6 +569,10 @@ async fn add_submit(
             &me.user,
             Notice::err("代码无效、已使用或已过期，请在电脑上重新运行登录命令。"),
         ));
+    }
+    if form.app == "1" {
+        let result = if approve { "approved" } else { "denied" };
+        return Ok(Redirect::to(&format!("{APP_CALLBACK}?result={result}")).into_response());
     }
     let (title, message) = if approve {
         (

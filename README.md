@@ -96,6 +96,8 @@ location / {
 
 1. 管理员打开 `https://runner.example.com` 完成初始化，然后在“用户管理”中添加用户。
 2. 每台电脑（无论是被控制的还是用来控制的）运行 `runner remote login --server https://runner.example.com`，在浏览器中打开显示的链接，登录并批准，核对代码和指纹，再回到终端确认账号。
+
+   手机 App 在系统登录浏览器里打开批准页，并在链接后加上 `app=1`。带这个参数时，批准或拒绝后页面会跳转到固定地址 `runner-remote-auth://enrollment?result=approved|denied`，登录浏览器随即关闭并回到 App；不带时页面照常显示结果。
 3. 被控制的电脑设置 PIN：`runner remote pin`。
 4. 在另一台电脑的 Runner 中打开远程电脑，首次连接输入 PIN 完成配对。
 
