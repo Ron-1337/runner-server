@@ -102,7 +102,7 @@ location / {
 
 | 路径 | 说明 |
 | --- | --- |
-| `POST /api/runner_server.v1.HostEnrollmentService/StartEnrollment` | 开始登录，返回 device code 与 user code（10 分钟有效） |
+| `POST /api/runner_server.v1.HostEnrollmentService/StartEnrollment` | 开始登录，返回 device code 与 user code（10 分钟有效）。可选字段 `"kind": "phone"` 表示手机：批准后立即可用，不出现在 `ListAccountHosts` 中，不能连 `/relay/host`，也不能作为连接目标；Runner 不发送该字段，按电脑处理 |
 | `POST /api/runner_server.v1.HostEnrollmentService/PollEnrollment` | 轮询；批准后签发 `rhc_` 凭据（只返回一次），10 分钟内需连上中继 |
 | `POST /api/runner_server.v1.HostEnrollmentService/SignOutHost` | 电脑注销 |
 | `POST /api/runner_server.v1.HostClientService/ListAccountHosts` | 同账号电脑列表 |
