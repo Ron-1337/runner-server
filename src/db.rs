@@ -443,6 +443,13 @@ pub fn delete_host(c: &Connection, id: i64, user_id: Option<i64>) -> Result<bool
     )? > 0)
 }
 
+pub fn rename_host(c: &Connection, id: i64, user_id: i64, name: &str) -> Result<bool> {
+    Ok(c.execute(
+        "UPDATE hosts SET name = ?3 WHERE id = ?1 AND user_id = ?2",
+        params![id, user_id, name],
+    )? > 0)
+}
+
 pub fn activate_host(c: &Connection, id: i64, info: &HostInfo, now: i64) -> Result<bool> {
     Ok(c.execute(
         "UPDATE hosts SET activated = 1, info = ?2, last_seen_at = ?3 WHERE id = ?1",

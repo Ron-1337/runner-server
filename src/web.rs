@@ -50,6 +50,7 @@ pub fn routes(state: AppState) -> Router<AppState> {
         .route("/hosts", get(hosts_page))
         .route("/hosts/add", get(add_page).post(add_submit))
         .route("/hosts/{id}/remove", post(remove_host))
+        .route("/hosts/{id}/rename", post(rename_host))
         .route("/account", get(account_page).post(account_submit))
         .route("/admin/users", get(users_page).post(create_user))
         .route("/admin/users/{id}/{action}", post(user_action))
@@ -328,7 +329,8 @@ async fn hosts_page(
         rows.push_str(&format!(
             r#"<tr><td><b>{name}</b><div class="muted">{platform} {arch} · {os} · Runner {version}</div></td>
 <td class="mono">{fp}</td><td>{status}</td><td>{created}</td>
-<td><form class="inline" method="post" action="/hosts/{id}/remove" onsubmit="return confirm('确定移除这台电脑？它需要重新登录才能再使用远程访问。')"><button class="danger">移除</button></form></td></tr>"#,
+<td><form class="inline row" method="post" action="/hosts/{id}/rename"><input type="text" name="name" value="{name}" required maxlength="64" style="width:160px"><button>改名</button></form>
+<form class="inline" method="post" action="/hosts/{id}/remove" onsubmit="return confirm('确定移除这台电脑？它需要重新登录才能再使用远程访问。')"><button class="danger">移除</button></form></td></tr>"#,
             name = e(&h.name),
             platform = e(&h.info.platform),
             arch = e(&h.info.arch),
@@ -348,6 +350,10 @@ async fn hosts_page(
     };
     let notice = match q.ok.as_deref() {
         Some("removed") => Notice::ok("已移除该电脑。"),
+        Some("renamed") => Notice::ok(
+            "已改名。其他 Runner 刷新电脑列表后会显示新名字；这台电脑自己下次连接服务时更新。",
+        ),
+        Some("bad-name") => Notice::err("名字不能为空，且不超过 64 个字符。"),
         _ => None,
     };
     Ok(page(
@@ -380,6 +386,37 @@ async fn remove_host(
         tracing::info!(host = id, "host removed from web");
     }
     Ok(Redirect::to("/hosts?ok=removed").into_response())
+}
+
+#[derive(Deserialize)]
+struct RenameForm {
+    name: String,
+}
+
+pub fn clean_host_name(name: &str) -> Option<String> {
+    let name: String = name.chars().filter(|c| !c.is_control()).collect();
+    let name = name.trim();
+    (!name.is_empty() && name.chars().count() <= 64).then(|| name.to_owned())
+}
+
+async fn rename_host(
+    State(state): State<AppState>,
+    me: CurrentUser,
+    Path(id): Path<i64>,
+    Form(form): Form<RenameForm>,
+) -> WebResult {
+    let Some(name) = clean_host_name(&form.name) else {
+        return Ok(Redirect::to("/hosts?ok=bad-name").into_response());
+    };
+    let user_id = me.user.id;
+    if state
+        .db
+        .call(move |c| db::rename_host(c, id, user_id, &name))
+        .await?
+    {
+        tracing::info!(host = id, "host renamed from web");
+    }
+    Ok(Redirect::to("/hosts?ok=renamed").into_response())
 }
 
 #[derive(Deserialize)]

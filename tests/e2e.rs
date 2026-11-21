@@ -442,6 +442,86 @@ async fn users_are_isolated_and_only_admins_manage_users() {
 }
 
 #[tokio::test]
+async fn renaming_a_computer_changes_what_other_runners_see() {
+    let s = server().await;
+    let admin = browser();
+    s.form(
+        &admin,
+        "/setup",
+        &[
+            ("username", "alice"),
+            ("password", "correct-horse"),
+            ("confirm", "correct-horse"),
+        ],
+    )
+    .await;
+    s.form(
+        &admin,
+        "/admin/users",
+        &[("username", "bob"), ("password", "battery-staple")],
+    )
+    .await;
+    let bob = browser();
+    s.form(
+        &bob,
+        "/login",
+        &[("username", "bob"), ("password", "battery-staple")],
+    )
+    .await;
+
+    let (a_id, a_cred) = s.enroll(&admin, "studio", 6).await;
+    let (_b_id, b_cred) = s.enroll(&admin, "laptop", 7).await;
+    let (srv, id) = (&s, a_id.as_str());
+    let list = |cred: String| async move {
+        srv.call("HostClientService/ListAccountHosts", Some(&cred), json!({}))
+            .await
+            .json::<Value>()
+            .await
+            .unwrap()["hosts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|h| h["id"] == id)
+            .map(|h| h["name"].as_str().unwrap().to_owned())
+    };
+    let (_host, welcome) = s.host(&a_cred).await;
+    assert_eq!(welcome["name"], "studio");
+    assert_eq!(list(b_cred.clone()).await.as_deref(), Some("studio"));
+
+    let renamed = s
+        .form(
+            &admin,
+            &format!("/hosts/{a_id}/rename"),
+            &[("name", "  工作室 Mac  ")],
+        )
+        .await;
+    assert!(renamed.text().await.unwrap().contains("已改名"));
+    assert_eq!(list(b_cred.clone()).await.as_deref(), Some("工作室 Mac"));
+
+    let (_again, welcome) = s.host(&a_cred).await;
+    assert_eq!(
+        welcome["name"], "工作室 Mac",
+        "the computer learns its new name when it reconnects"
+    );
+
+    let blank = s
+        .form(&admin, &format!("/hosts/{a_id}/rename"), &[("name", "   ")])
+        .await;
+    assert!(blank.text().await.unwrap().contains("名字不能为空"));
+    s.form(
+        &bob,
+        &format!("/hosts/{a_id}/rename"),
+        &[("name", "hijacked")],
+    )
+    .await;
+    assert_eq!(
+        list(b_cred).await.as_deref(),
+        Some("工作室 Mac"),
+        "other users cannot rename it"
+    );
+}
+
+#[tokio::test]
 async fn disabling_a_user_disconnects_their_computers() {
     let s = server().await;
     let admin = browser();
