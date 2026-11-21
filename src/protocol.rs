@@ -43,17 +43,33 @@ pub struct Account {
     pub display_name: String,
 }
 
-/// What kind of device is enrolling. Not part of Runner's protocol: Runner never
-/// sends it, so its enrollments are computers. A phone (the Runner Remote app)
-/// only opens client routes, so it is never listed as a computer to connect to.
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+/// What kind of device is enrolling. Runner never sends it, so its enrollments
+/// are computers. A phone only opens client routes, so it is never listed as a
+/// computer to connect to.
+///
+/// On the wire this is the official service's `EnrollmentKind`
+/// (`ENROLLMENT_KIND_HOST` / `ENROLLMENT_KIND_CLIENT`, or their numbers 1 / 2);
+/// this service's earlier `"phone"` is still accepted. It serializes as
+/// `"phone"` / `"computer"`, which is what `channelOpen.device.kind` carries.
+#[derive(Clone, Copy, Debug, Default, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum DeviceKind {
     Phone,
     /// Also any value this server does not know.
     #[default]
-    #[serde(other)]
     Computer,
+}
+
+impl<'de> Deserialize<'de> for DeviceKind {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Ok(match serde_json::Value::deserialize(d)? {
+            serde_json::Value::String(s) if s == "phone" || s == "ENROLLMENT_KIND_CLIENT" => {
+                Self::Phone
+            }
+            serde_json::Value::Number(n) if n.as_u64() == Some(2) => Self::Phone,
+            _ => Self::Computer,
+        })
+    }
 }
 
 impl DeviceKind {
@@ -76,6 +92,38 @@ impl DeviceKind {
     }
 }
 
+/// What a phone says about itself (the official service's `ClientInfo`).
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ClientInfo {
+    pub name: String,
+    pub platform: String,
+    pub os_version: String,
+    pub runner_version: String,
+}
+
+impl ClientInfo {
+    /// Phones are stored with the computers; their info goes in a [HostInfo].
+    pub fn into_host_info(self) -> HostInfo {
+        HostInfo {
+            hostname: self.name,
+            platform: self.platform,
+            arch: String::new(),
+            os_version: self.os_version,
+            runner_version: self.runner_version,
+        }
+    }
+
+    pub fn from_host_info(info: &HostInfo) -> Self {
+        Self {
+            name: info.hostname.clone(),
+            platform: info.platform.clone(),
+            os_version: info.os_version.clone(),
+            runner_version: info.runner_version.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct StartRequest {
@@ -83,6 +131,19 @@ pub struct StartRequest {
     pub host_key: String,
     #[serde(skip_serializing_if = "DeviceKind::is_computer")]
     pub kind: DeviceKind,
+    /// Sent with `ENROLLMENT_KIND_CLIENT` instead of [StartRequest::host].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client: Option<ClientInfo>,
+}
+
+impl StartRequest {
+    /// The device's info: a phone's [ClientInfo] when it sent one, else `host`.
+    pub fn device_info(self) -> HostInfo {
+        match (self.kind, self.client) {
+            (DeviceKind::Phone, Some(client)) => client.into_host_info(),
+            _ => self.host,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -116,6 +177,9 @@ pub struct PollResponse {
     pub account: Option<Account>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub claim_expires_at: Option<String>,
+    /// Set for a phone, as the official service does; the same id as `hostId`.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub client_id: String,
 }
 fn secret_empty(s: &Secret) -> bool {
     s.0.is_empty()
@@ -163,14 +227,40 @@ pub enum Control {
         #[serde(default)]
         account: Account,
     },
+    /// `device` is this service's addition: the device that opened the channel.
+    /// Runner ignores it; a host that knows it uses it to address [Control::Notify].
     #[serde(rename = "channelOpen")]
-    ChannelOpen { channel: u32 },
+    ChannelOpen {
+        channel: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        device: Option<ChannelDevice>,
+    },
     #[serde(rename = "channelClosed")]
     ChannelClosed { channel: u32 },
     #[serde(rename = "closeChannel")]
     CloseChannel { channel: u32 },
+    /// Host to service: notify [device], a phone of the same account, about
+    /// [session]. The service delivers it through the phone's channel and adds
+    /// the link that opens the session in the app. Not part of Runner's protocol.
+    Notify {
+        device: String,
+        #[serde(default)]
+        session: Option<String>,
+        #[serde(default)]
+        title: String,
+        #[serde(default)]
+        body: String,
+    },
     #[serde(other)]
     Unknown,
+}
+
+/// The device behind a channel, as `channelOpen` names it.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ChannelDevice {
+    pub id: String,
+    pub kind: DeviceKind,
 }
 
 /// One computer in `HostClientService/ListAccountHosts`.
@@ -319,6 +409,28 @@ mod tests {
     }
 
     #[test]
+    fn channel_open_names_the_device_and_notify_parses() {
+        let open = Control::ChannelOpen {
+            channel: 3,
+            device: Some(ChannelDevice {
+                id: "42".into(),
+                kind: DeviceKind::Phone,
+            }),
+        };
+        assert_eq!(
+            serde_json::to_value(&open).unwrap(),
+            serde_json::json!({"type":"channelOpen","channel":3,"device":{"id":"42","kind":"phone"}})
+        );
+        let notify: Control = serde_json::from_str(
+            r#"{"type":"notify","device":"42","session":"s1","title":"t","body":"b"}"#,
+        )
+        .unwrap();
+        assert!(
+            matches!(notify, Control::Notify { device, session: Some(s), .. } if device == "42" && s == "s1")
+        );
+    }
+
+    #[test]
     fn device_kind_defaults_to_computer() {
         let runner: StartRequest = serde_json::from_str(r#"{"hostKey":"k"}"#).unwrap();
         assert_eq!(runner.kind, DeviceKind::Computer);
@@ -326,6 +438,25 @@ mod tests {
         assert_eq!(phone.kind, DeviceKind::Phone);
         let unknown: StartRequest = serde_json::from_str(r#"{"kind":"toaster"}"#).unwrap();
         assert_eq!(unknown.kind, DeviceKind::Computer);
+        for (json, kind) in [
+            (r#"{"kind":"ENROLLMENT_KIND_CLIENT"}"#, DeviceKind::Phone),
+            (r#"{"kind":2}"#, DeviceKind::Phone),
+            (r#"{"kind":"ENROLLMENT_KIND_HOST"}"#, DeviceKind::Computer),
+            (r#"{"kind":1}"#, DeviceKind::Computer),
+        ] {
+            assert_eq!(
+                serde_json::from_str::<StartRequest>(json).unwrap().kind,
+                kind,
+                "{json}"
+            );
+        }
+        let official: StartRequest = serde_json::from_str(
+            r#"{"hostKey":"k","kind":"ENROLLMENT_KIND_CLIENT","client":{"name":"iPhone","platform":"ios","osVersion":"18.1","runnerVersion":"1.0"}}"#,
+        )
+        .unwrap();
+        let info = official.device_info();
+        assert_eq!(info.hostname, "iPhone");
+        assert_eq!(info.os_version, "18.1");
         assert_eq!(
             DeviceKind::parse(DeviceKind::Phone.as_str()),
             DeviceKind::Phone

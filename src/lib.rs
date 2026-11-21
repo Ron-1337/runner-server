@@ -1,7 +1,9 @@
+pub mod api;
 pub mod auth;
 pub mod config;
 pub mod db;
 pub mod html;
+pub mod notify;
 pub mod protocol;
 pub mod relay;
 pub mod rpc;
@@ -18,6 +20,7 @@ pub struct Inner {
     pub db: db::Db,
     pub hub: relay::Hub,
     pub limiter: auth::LoginLimiter,
+    pub notifier: notify::Notifier,
 }
 
 impl Deref for AppState {
@@ -34,6 +37,7 @@ impl AppState {
             db,
             hub: relay::Hub::default(),
             limiter: auth::LoginLimiter::default(),
+            notifier: notify::Notifier::default(),
         }))
     }
 }
@@ -41,6 +45,7 @@ impl AppState {
 pub fn app(state: AppState) -> Router {
     Router::new()
         .merge(rpc::routes())
+        .merge(api::routes(state.clone()))
         .merge(relay::routes())
         .merge(web::routes(state.clone()))
         .with_state(state)

@@ -63,13 +63,16 @@ async fn main() -> anyhow::Result<()> {
         .with_context(|| format!("bind {}", cli.listen))?;
     tracing::info!("listening on {} for {}", cli.listen, state.config.origin);
     let hub = state.clone();
-    axum::serve(listener, app(state))
-        .with_graceful_shutdown(async move {
-            shutdown_signal().await;
-            tracing::info!("shutting down");
-            hub.hub.shutdown();
-        })
-        .await?;
+    axum::serve(
+        listener,
+        app(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        shutdown_signal().await;
+        tracing::info!("shutting down");
+        hub.hub.shutdown();
+    })
+    .await?;
     tokio::time::sleep(Duration::from_millis(500)).await;
     Ok(())
 }

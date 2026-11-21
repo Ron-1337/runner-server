@@ -1,6 +1,6 @@
 use crate::{
-    AppState, auth, db, now,
-    protocol::{self, Account, CLIENT_SUBPROTOCOL, Control, DeviceKind, MAX_FRAME},
+    AppState, auth, db, notify, now,
+    protocol::{self, Account, CLIENT_SUBPROTOCOL, ChannelDevice, Control, DeviceKind, MAX_FRAME},
 };
 use axum::{
     Router,
@@ -57,6 +57,8 @@ enum ClientOut {
 
 struct ChannelEntry {
     tx: mpsc::UnboundedSender<ClientOut>,
+    device: ChannelDevice,
+    opened_at: DateTime<Utc>,
     to_client: Arc<AtomicUsize>,
     to_host: Arc<AtomicUsize>,
 }
@@ -91,6 +93,17 @@ impl HostEntry {
             self.send_text(&Control::ChannelClosed { channel });
         }
     }
+}
+
+/// One device's open channels to one computer, for `HostService/ListConnections`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenConnection {
+    pub host: i64,
+    /// The host id of the device that opened the channels.
+    pub device: i64,
+    pub kind: DeviceKind,
+    /// When its oldest open channel was opened.
+    pub since: DateTime<Utc>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -150,9 +163,27 @@ impl Hub {
         }
     }
 
+    /// Disconnects device [id]: its host connection, if it is a computer, and
+    /// the channels it opened to other computers.
     pub fn kick(&self, id: i64, code: u16, reason: &'static str) {
-        if let Some(entry) = self.lock().remove(&id) {
+        let mut hosts = self.lock();
+        if let Some(entry) = hosts.remove(&id) {
             entry.close_all(code, reason);
+        }
+        let device = id.to_string();
+        for entry in hosts.values_mut() {
+            let opened: Vec<u32> = entry
+                .channels
+                .iter()
+                .filter(|(_, c)| c.device.id == device)
+                .map(|(n, _)| *n)
+                .collect();
+            for channel in opened {
+                if let Some(c) = entry.channels.remove(&channel) {
+                    let _ = c.tx.send(ClientOut::Close(code, reason));
+                    entry.send_text(&Control::ChannelClosed { channel });
+                }
+            }
         }
     }
 
@@ -166,6 +197,36 @@ impl Hub {
         self.lock().get(&id).map(|h| h.connected_at)
     }
 
+    /// The devices with channels open to any of [hosts], one entry per pair.
+    pub fn connections(&self, hosts: &[i64]) -> Vec<OpenConnection> {
+        let map = self.lock();
+        let mut out: Vec<OpenConnection> = Vec::new();
+        for &host in hosts {
+            let Some(entry) = map.get(&host) else {
+                continue;
+            };
+            for channel in entry.channels.values() {
+                let Ok(device) = channel.device.id.parse::<i64>() else {
+                    continue;
+                };
+                match out
+                    .iter_mut()
+                    .find(|c| c.host == host && c.device == device)
+                {
+                    Some(c) => c.since = c.since.min(channel.opened_at),
+                    None => out.push(OpenConnection {
+                        host,
+                        device,
+                        kind: channel.device.kind,
+                        since: channel.opened_at,
+                    }),
+                }
+            }
+        }
+        out.sort_by_key(|c| (c.since, c.host, c.device));
+        out
+    }
+
     pub fn can_open(&self, id: i64) -> Result<(), OpenError> {
         match self.lock().get(&id) {
             None => Err(OpenError::Offline),
@@ -174,7 +235,7 @@ impl Hub {
         }
     }
 
-    fn open_channel(&self, id: i64) -> Result<ClientLink, OpenError> {
+    fn open_channel(&self, id: i64, device: ChannelDevice) -> Result<ClientLink, OpenError> {
         let mut hosts = self.lock();
         let entry = hosts.get_mut(&id).ok_or(OpenError::Offline)?;
         if entry.channels.len() >= MAX_CHANNELS_PER_HOST {
@@ -192,11 +253,16 @@ impl Hub {
             channel,
             ChannelEntry {
                 tx,
+                device: device.clone(),
+                opened_at: Utc::now(),
                 to_client: Arc::default(),
                 to_host: Arc::default(),
             },
         );
-        entry.send_text(&Control::ChannelOpen { channel });
+        entry.send_text(&Control::ChannelOpen {
+            channel,
+            device: Some(device),
+        });
         Ok(ClientLink {
             channel,
             conn: entry.conn,
@@ -355,6 +421,7 @@ async fn serve_host(state: AppState, socket: WebSocket, host: db::Host, user: db
     let conn = state.hub.attach_host(id, tx);
     tracing::info!(host = id, user = %user.username, "host connected");
     let mut writer = tokio::spawn(write_host(sink, rx));
+    let mut limit = NotifyLimit::default();
 
     loop {
         tokio::select! {
@@ -366,10 +433,22 @@ async fn serve_host(state: AppState, socket: WebSocket, host: db::Host, user: db
                     }
                 }
                 Ok(Some(Ok(Message::Text(text)))) => {
-                    if text.len() <= protocol::MAX_CONTROL_SIZE
-                        && let Ok(Control::CloseChannel { channel }) = serde_json::from_str(&text) {
+                    if text.len() > protocol::MAX_CONTROL_SIZE {
+                        continue;
+                    }
+                    match serde_json::from_str(&text) {
+                        Ok(Control::CloseChannel { channel }) => {
                             state.hub.close_channel(id, conn, channel);
                         }
+                        Ok(Control::Notify { device, session, title, body }) => {
+                            if limit.allow() {
+                                spawn_notify(&state, &host, &user, device, session, title, body);
+                            } else {
+                                tracing::warn!(host = id, "notification dropped: rate limit");
+                            }
+                        }
+                        _ => {}
+                    }
                 }
                 Ok(Some(Ok(Message::Ping(_) | Message::Pong(_)))) => {}
                 _ => break,
@@ -379,6 +458,63 @@ async fn serve_host(state: AppState, socket: WebSocket, host: db::Host, user: db
     state.hub.detach_host(id, conn);
     tracing::info!(host = id, "host disconnected");
     let _ = state.db.call(move |c| db::touch_host(c, id, now())).await;
+}
+
+/// At most [NotifyLimit::MAX] notifications per host connection per minute.
+#[derive(Default)]
+struct NotifyLimit {
+    window: Option<tokio::time::Instant>,
+    count: u32,
+}
+
+impl NotifyLimit {
+    const MAX: u32 = 30;
+
+    fn allow(&mut self) -> bool {
+        let now = tokio::time::Instant::now();
+        match self.window {
+            Some(start) if now.duration_since(start) < Duration::from_secs(60) => {}
+            _ => {
+                self.window = Some(now);
+                self.count = 0;
+            }
+        }
+        self.count += 1;
+        self.count <= Self::MAX
+    }
+}
+
+/// Delivers a host's `notify` to the phone it names, off the relay loop.
+fn spawn_notify(
+    state: &AppState,
+    host: &db::Host,
+    user: &db::User,
+    device: String,
+    session: Option<String>,
+    title: String,
+    body: String,
+) {
+    let Ok(device) = device.parse::<i64>() else {
+        return;
+    };
+    let url = notify::app_link(
+        &state.config.origin,
+        &user.username,
+        Some((host.id, session.as_deref())),
+    );
+    let message = notify::Message {
+        title,
+        body,
+        url: Some(url),
+    };
+    let (state, host_id, user_id) = (state.clone(), host.id, user.id);
+    tokio::spawn(async move {
+        match notify::deliver(&state, user_id, device, message).await {
+            Ok(true) => tracing::info!(host = host_id, device, "notification sent"),
+            Ok(false) => tracing::debug!(host = host_id, device, "no notification channel"),
+            Err(e) => tracing::warn!(host = host_id, device, "notification failed: {e:#}"),
+        }
+    });
 }
 
 async fn send(sink: &mut SplitSink<WebSocket, Message>, message: Message) -> bool {
@@ -465,12 +601,16 @@ async fn client_upgrade(
     ws.protocols([CLIENT_SUBPROTOCOL])
         .max_message_size(MAX_FRAME)
         .max_frame_size(MAX_FRAME)
-        .on_upgrade(move |socket| serve_client(state, socket, target))
+        .on_upgrade(move |socket| serve_client(state, socket, target, me))
 }
 
-async fn serve_client(state: AppState, socket: WebSocket, host: i64) {
+async fn serve_client(state: AppState, socket: WebSocket, host: i64, me: db::Host) {
     let (mut sink, mut stream) = socket.split();
-    let mut link = match state.hub.open_channel(host) {
+    let device = ChannelDevice {
+        id: me.id.to_string(),
+        kind: me.kind,
+    };
+    let mut link = match state.hub.open_channel(host, device) {
         Ok(link) => link,
         Err(_) => {
             let _ = sink.send(close(1013, "host unavailable")).await;

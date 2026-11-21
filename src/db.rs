@@ -1,4 +1,7 @@
-use crate::protocol::{DeviceKind, HostInfo};
+use crate::{
+    notify::Channel,
+    protocol::{DeviceKind, HostInfo},
+};
 use anyhow::Result;
 use rusqlite::{Connection, ErrorCode, OptionalExtension, Row, params};
 use std::{
@@ -47,12 +50,20 @@ CREATE TABLE IF NOT EXISTS hosts (
 );
 CREATE INDEX IF NOT EXISTS hosts_user ON hosts(user_id);
 CREATE INDEX IF NOT EXISTS hosts_key ON hosts(host_key);
+CREATE TABLE IF NOT EXISTS notify_channels (
+    host_id INTEGER PRIMARY KEY REFERENCES hosts(id) ON DELETE CASCADE,
+    config TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
+);
 "#;
 
 /// Columns added after the first release, as (table, column, definition).
 const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("enrollments", "kind", "TEXT NOT NULL DEFAULT 'computer'"),
     ("hosts", "kind", "TEXT NOT NULL DEFAULT 'computer'"),
+    ("users", "last_login_at", "INTEGER"),
+    ("enrollments", "requesting_ip", "TEXT NOT NULL DEFAULT ''"),
+    ("enrollments", "name", "TEXT NOT NULL DEFAULT ''"),
 ];
 
 fn migrate(c: &Connection) -> Result<()> {
@@ -110,9 +121,13 @@ pub struct User {
     pub is_admin: bool,
     pub disabled: bool,
     pub created_at: i64,
+    pub last_login_at: Option<i64>,
 }
 
-const USER_COLS: &str = "u.id, u.username, u.display_name, u.is_admin, u.disabled, u.created_at";
+const USER_COLS: &str =
+    "u.id, u.username, u.display_name, u.is_admin, u.disabled, u.created_at, u.last_login_at";
+/// Number of columns in `USER_COLS`.
+const USER_WIDTH: usize = 7;
 
 fn user_at(r: &Row, at: usize) -> rusqlite::Result<User> {
     Ok(User {
@@ -122,6 +137,7 @@ fn user_at(r: &Row, at: usize) -> rusqlite::Result<User> {
         is_admin: r.get(at + 3)?,
         disabled: r.get(at + 4)?,
         created_at: r.get(at + 5)?,
+        last_login_at: r.get(at + 6)?,
     })
 }
 
@@ -160,7 +176,7 @@ pub fn user_with_hash(c: &Connection, username: &str) -> Result<Option<(User, St
     Ok(c.query_row(
         &format!("SELECT {USER_COLS}, u.password_hash FROM users u WHERE u.username = ?1"),
         [username],
-        |r| Ok((user_at(r, 0)?, r.get(6)?)),
+        |r| Ok((user_at(r, 0)?, r.get(USER_WIDTH)?)),
     )
     .optional()?)
 }
@@ -201,6 +217,14 @@ pub fn set_disabled(c: &Connection, id: i64, disabled: bool) -> Result<bool> {
     )? > 0)
 }
 
+pub fn touch_login(c: &Connection, id: i64, now: i64) -> Result<()> {
+    c.execute(
+        "UPDATE users SET last_login_at = ?2 WHERE id = ?1",
+        params![id, now],
+    )?;
+    Ok(())
+}
+
 pub fn delete_user(c: &Connection, id: i64) -> Result<bool> {
     Ok(c.execute("DELETE FROM users WHERE id = ?1", [id])? > 0)
 }
@@ -230,6 +254,14 @@ pub fn session_user(c: &Connection, token_hash: &str, now: i64) -> Result<Option
     .optional()?)
 }
 
+/// Moves a live session's expiry to [expires_at]; false when it is gone or expired.
+pub fn extend_session(c: &Connection, token_hash: &str, expires_at: i64, now: i64) -> Result<bool> {
+    Ok(c.execute(
+        "UPDATE web_sessions SET expires_at = ?2 WHERE token_hash = ?1 AND expires_at > ?3",
+        params![token_hash, expires_at, now],
+    )? > 0)
+}
+
 pub fn delete_session(c: &Connection, token_hash: &str) -> Result<()> {
     c.execute(
         "DELETE FROM web_sessions WHERE token_hash = ?1",
@@ -256,10 +288,15 @@ pub struct Enrollment {
     pub user_id: Option<i64>,
     pub expires_at: i64,
     pub kind: DeviceKind,
+    /// The address StartEnrollment came from, shown on the approval page.
+    pub requesting_ip: String,
+    /// The name chosen when approving; empty for the device's own name.
+    pub name: String,
+    /// Set by the database; ignored by [insert_enrollment].
+    pub created_at: i64,
 }
 
-const ENROLLMENT_COLS: &str =
-    "device_hash, user_code, host_key, info, state, user_id, expires_at, kind";
+const ENROLLMENT_COLS: &str = "device_hash, user_code, host_key, info, state, user_id, expires_at, kind, requesting_ip, name, created_at";
 
 fn enrollment_row(r: &Row) -> rusqlite::Result<Enrollment> {
     Ok(Enrollment {
@@ -271,13 +308,16 @@ fn enrollment_row(r: &Row) -> rusqlite::Result<Enrollment> {
         user_id: r.get(5)?,
         expires_at: r.get(6)?,
         kind: DeviceKind::parse(&r.get::<_, String>(7)?),
+        requesting_ip: r.get(8)?,
+        name: r.get(9)?,
+        created_at: r.get(10)?,
     })
 }
 
 pub fn insert_enrollment(c: &Connection, e: &Enrollment, now: i64) -> Result<bool> {
     match c.execute(
-        "INSERT INTO enrollments (device_hash, user_code, host_key, info, state, user_id, created_at, expires_at, kind)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        "INSERT INTO enrollments (device_hash, user_code, host_key, info, state, user_id, created_at, expires_at, kind, requesting_ip)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
             e.device_hash,
             e.user_code,
@@ -287,7 +327,8 @@ pub fn insert_enrollment(c: &Connection, e: &Enrollment, now: i64) -> Result<boo
             e.user_id,
             now,
             e.expires_at,
-            e.kind.as_str()
+            e.kind.as_str(),
+            e.requesting_ip
         ],
     ) {
         Ok(_) => Ok(true),
@@ -322,21 +363,24 @@ pub fn enrollment_by_device(c: &Connection, device_hash: &str) -> Result<Option<
     .optional()?)
 }
 
+/// Approves or denies a pending enrollment; [name] renames the device on approval.
 pub fn decide_enrollment(
     c: &Connection,
     user_code: &str,
     approve: bool,
     user_id: i64,
+    name: Option<&str>,
     now: i64,
 ) -> Result<bool> {
     Ok(c.execute(
-        "UPDATE enrollments SET state = ?2, user_id = ?3
+        "UPDATE enrollments SET state = ?2, user_id = ?3, name = ?5
          WHERE user_code = ?1 AND state = 'pending' AND expires_at > ?4",
         params![
             user_code,
             if approve { "approved" } else { "denied" },
             user_id,
-            now
+            now,
+            name.unwrap_or_default()
         ],
     )? > 0)
 }
@@ -498,6 +542,36 @@ pub fn touch_host(c: &Connection, id: i64, now: i64) -> Result<()> {
         "UPDATE hosts SET last_seen_at = ?2 WHERE id = ?1",
         params![id, now],
     )?;
+    Ok(())
+}
+
+/// How notifications reach the phone [host_id], if set on the web page.
+pub fn notify_channel(c: &Connection, host_id: i64) -> Result<Option<Channel>> {
+    let config: Option<String> = c
+        .query_row(
+            "SELECT config FROM notify_channels WHERE host_id = ?1",
+            [host_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    // A channel this version cannot read counts as none.
+    Ok(config.and_then(|c| serde_json::from_str(&c).ok()))
+}
+
+pub fn set_notify_channel(
+    c: &Connection,
+    host_id: i64,
+    channel: Option<&Channel>,
+    now: i64,
+) -> Result<()> {
+    match channel {
+        Some(channel) => c.execute(
+            "INSERT INTO notify_channels (host_id, config, updated_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(host_id) DO UPDATE SET config = excluded.config, updated_at = excluded.updated_at",
+            params![host_id, serde_json::to_string(channel)?, now],
+        )?,
+        None => c.execute("DELETE FROM notify_channels WHERE host_id = ?1", [host_id])?,
+    };
     Ok(())
 }
 

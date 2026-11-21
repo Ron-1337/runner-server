@@ -4,7 +4,7 @@ use argon2::{
     password_hash::{SaltString, rand_core::OsRng as HashRng},
 };
 use axum::{
-    extract::FromRequestParts,
+    extract::{ConnectInfo, FromRequestParts},
     http::{HeaderMap, header, request::Parts},
     response::{IntoResponse, Redirect, Response},
 };
@@ -13,6 +13,8 @@ use rand::{Rng, RngCore, rngs::OsRng};
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
+    convert::Infallible,
+    net::SocketAddr,
     sync::{LazyLock, Mutex},
     time::{Duration, Instant},
 };
@@ -110,6 +112,34 @@ pub fn validate_password(password: &str, confirm: &str) -> Result<(), &'static s
     Ok(())
 }
 
+/// Checks a new account's fields; returns the trimmed username and the display
+/// name (the username when left empty).
+pub fn new_user_fields(
+    username: &str,
+    display_name: &str,
+    password: &str,
+    confirm: &str,
+) -> Result<(String, String), &'static str> {
+    let username = username.trim().to_owned();
+    validate_username(&username)?;
+    validate_password(password, confirm)?;
+    let display = display_name.trim();
+    let display = if display.is_empty() {
+        username.clone()
+    } else {
+        display.chars().take(64).collect()
+    };
+    Ok((username, display))
+}
+
+/// A password an administrator hands over after a reset.
+pub fn temporary_password() -> String {
+    const ALPHABET: &[u8] = b"abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    (0..16)
+        .map(|_| ALPHABET[OsRng.gen_range(0..ALPHABET.len())] as char)
+        .collect()
+}
+
 #[derive(Default)]
 pub struct LoginLimiter(Mutex<HashMap<String, (u32, Instant)>>);
 
@@ -164,6 +194,41 @@ pub fn bearer(headers: &HeaderMap) -> Option<String> {
     let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
     let token = value.strip_prefix("Bearer ")?.trim();
     crate::protocol::valid_credential(token).then(|| token.to_owned())
+}
+
+/// The address a request came from, for display only. Forwarding headers count
+/// only when the connection comes from this machine (a reverse proxy), or when
+/// the peer is unknown; the rightmost `X-Forwarded-For` entry is the proxy's.
+pub struct ClientIp(pub String);
+
+impl<S: Send + Sync> FromRequestParts<S> for ClientIp {
+    type Rejection = Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, Infallible> {
+        let peer = parts
+            .extensions
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|c| c.0.ip());
+        let header = |name: &str| {
+            parts
+                .headers
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.rsplit(',').next())
+                .map(|v| v.trim().to_owned())
+                .filter(|v| !v.is_empty())
+        };
+        let forwarded = match peer {
+            Some(ip) if !ip.is_loopback() => None,
+            _ => header("x-forwarded-for").or_else(|| header("x-real-ip")),
+        };
+        let ip = forwarded
+            .or_else(|| peer.map(|ip| ip.to_string()))
+            .unwrap_or_default();
+        Ok(Self(
+            ip.chars().filter(|c| !c.is_control()).take(64).collect(),
+        ))
+    }
 }
 
 pub async fn start_session(state: &AppState, user_id: i64) -> anyhow::Result<String> {

@@ -146,6 +146,35 @@ impl Server {
         (issued.host_id.clone(), issued.credential.0.clone())
     }
 
+    /// A web API call from [client]'s browser session: status and JSON body.
+    async fn web(&self, client: &reqwest::Client, path: &str, body: Value) -> (u16, Value) {
+        let response = client
+            .post(format!("{}/api/runner_server.v1.{path}", self.origin))
+            .header("Origin", &self.origin)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        let status = response.status().as_u16();
+        (status, response.json().await.unwrap_or(Value::Null))
+    }
+
+    /// Creates the first account, alice, signed in on [client].
+    async fn setup(&self, client: &reqwest::Client) {
+        let created = self
+            .form(
+                client,
+                "/setup",
+                &[
+                    ("username", "alice"),
+                    ("password", "correct-horse"),
+                    ("confirm", "correct-horse"),
+                ],
+            )
+            .await;
+        assert_eq!(created.url().path(), "/hosts");
+    }
+
     /// The ids `ListAccountHosts` returns to this credential.
     async fn host_ids(&self, credential: &str) -> Vec<String> {
         let hosts: Value = self
@@ -710,4 +739,611 @@ async fn phones_connect_to_computers_but_are_not_listed_as_computers() {
         )
         .await;
     assert_eq!(listed.status(), 401, "a removed phone is signed out");
+}
+
+/// A stand-in Bark server that records every push.
+async fn fake_bark() -> (String, tokio::sync::mpsc::UnboundedReceiver<Value>) {
+    use axum::{Json, Router, routing::post};
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let router = Router::new().route(
+        "/push",
+        post(move |Json(body): Json<Value>| {
+            let tx = tx.clone();
+            async move {
+                let _ = tx.send(body);
+                Json(json!({"code": 200, "message": "success"}))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    (origin, rx)
+}
+
+#[tokio::test]
+async fn hosts_notify_the_phone_that_opened_a_channel_through_bark() {
+    let s = server().await;
+    let admin = browser();
+    s.form(
+        &admin,
+        "/setup",
+        &[
+            ("username", "alice"),
+            ("password", "correct-horse"),
+            ("confirm", "correct-horse"),
+        ],
+    )
+    .await;
+    let (pc_id, pc_cred) = s.enroll(&admin, "studio", 1).await;
+    let (mut host, _) = s.host(&pc_cred).await;
+    let phone_request = json!({
+        "host": {"hostname": "iPhone", "platform": "ios"},
+        "hostKey": STANDARD.encode([3; 32]),
+        "kind": "phone",
+    });
+    let (phone_id, phone_cred) = s.enroll_with(&admin, phone_request, 3).await;
+
+    // The phone's channel is configured on the web page; a computer has no such page.
+    let (bark, mut pushes) = fake_bark().await;
+    let hosts = admin
+        .get(format!("{}/hosts", s.origin))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(hosts.contains(&format!("/hosts/{phone_id}/notify")));
+    assert!(!hosts.contains(&format!("/hosts/{pc_id}/notify")));
+    let missing = admin
+        .get(format!("{}/hosts/{pc_id}/notify", s.origin))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), 404);
+    let bad = s
+        .form(
+            &admin,
+            &format!("/hosts/{phone_id}/notify"),
+            &[
+                ("channel", "bark"),
+                ("server", &bark),
+                ("device_key", "no spaces"),
+            ],
+        )
+        .await
+        .text()
+        .await
+        .unwrap();
+    assert!(bad.contains("Device Key 无效"), "{bad}");
+    let saved = s
+        .form(
+            &admin,
+            &format!("/hosts/{phone_id}/notify"),
+            &[
+                ("channel", "bark"),
+                ("server", &bark),
+                ("device_key", "phone-key"),
+                ("group", "Runner"),
+                ("sound", ""),
+                ("level", "timeSensitive"),
+            ],
+        )
+        .await;
+    let saved_url = saved.url().clone();
+    assert_eq!(
+        saved_url.query(),
+        Some("ok=saved"),
+        "{}",
+        saved.text().await.unwrap()
+    );
+
+    let tested = s
+        .form(&admin, &format!("/hosts/{phone_id}/notify/test"), &[])
+        .await;
+    assert_eq!(tested.url().query(), Some("ok=sent"));
+    let test = timeout(WAIT, pushes.recv()).await.unwrap().unwrap();
+    assert_eq!(test["device_key"], "phone-key");
+    assert_eq!(test["level"], "timeSensitive");
+
+    // channelOpen names the device behind the channel.
+    let _client = s
+        .ws(
+            &format!("/relay/client?host={pc_id}"),
+            &phone_cred,
+            remote::CLIENT_SUBPROTOCOL,
+        )
+        .await
+        .unwrap();
+    let open = text(&mut host).await;
+    assert_eq!(open["device"], json!({"id": phone_id, "kind": "phone"}));
+
+    // The host names the phone; the service adds the link into the app.
+    let notify = json!({"type": "notify", "device": phone_id, "session": "s1", "title": "Fix the build", "body": "需要你 · runner"});
+    host.send(Message::Text(notify.to_string().into()))
+        .await
+        .unwrap();
+    let push = timeout(WAIT, pushes.recv()).await.unwrap().unwrap();
+    assert_eq!(push["title"], "Fix the build");
+    assert_eq!(push["body"], "需要你 · runner");
+    assert_eq!(push["group"], "Runner");
+    let link = url::Url::parse(push["url"].as_str().unwrap()).unwrap();
+    assert_eq!(link.scheme(), "runner-remote");
+    assert_eq!(link.host_str(), Some("open"));
+    let query: std::collections::HashMap<_, _> = link.query_pairs().into_owned().collect();
+    assert_eq!(query["server"], s.origin);
+    assert_eq!(query["user"], "alice");
+    assert_eq!(query["computer"], pc_id);
+    assert_eq!(query["session"], "s1");
+
+    // A device that is not one of the account's phones gets nothing.
+    for device in [pc_id.as_str(), "999"] {
+        let notify = json!({"type": "notify", "device": device, "title": "x"});
+        host.send(Message::Text(notify.to_string().into()))
+            .await
+            .unwrap();
+    }
+    // Turning the channel off stops pushes too.
+    s.form(
+        &admin,
+        &format!("/hosts/{phone_id}/notify"),
+        &[("channel", "")],
+    )
+    .await;
+    let notify = json!({"type": "notify", "device": phone_id, "title": "x"});
+    host.send(Message::Text(notify.to_string().into()))
+        .await
+        .unwrap();
+    assert!(
+        timeout(Duration::from_millis(500), pushes.recv())
+            .await
+            .is_err(),
+        "no push for other devices or a phone without a channel"
+    );
+}
+
+#[tokio::test]
+async fn phones_enroll_in_the_official_format_and_sign_out_as_clients() {
+    let s = server().await;
+    let admin = browser();
+    s.setup(&admin).await;
+    let (pc_id, pc_cred) = s.enroll(&admin, "studio", 1).await;
+    let (_host, _) = s.host(&pc_cred).await;
+    let request = json!({
+        "hostKey": STANDARD.encode([4; 32]),
+        "kind": "ENROLLMENT_KIND_CLIENT",
+        "client": {"name": "Alice's iPhone", "platform": "ios", "osVersion": "26.1", "runnerVersion": "1.2.0"},
+    });
+    let (phone_id, phone_cred) = s.enroll_with(&admin, request, 4).await;
+    assert_eq!(s.host_ids(&phone_cred).await, vec![pc_id.clone()]);
+    assert_eq!(
+        s.host_ids(&pc_cred).await,
+        vec![pc_id.clone()],
+        "not listed as a computer"
+    );
+    assert_eq!(
+        refused_status(s.ws("/relay/host", &phone_cred, remote::SUBPROTOCOL).await),
+        403
+    );
+
+    let denied = s
+        .call(
+            "HostEnrollmentService/SignOutClient",
+            Some(&pc_cred),
+            json!({}),
+        )
+        .await;
+    assert_eq!(
+        denied.status(),
+        403,
+        "a computer cannot sign out as a client"
+    );
+    let signed_out = s
+        .call(
+            "HostEnrollmentService/SignOutClient",
+            Some(&phone_cred),
+            json!({}),
+        )
+        .await;
+    assert_eq!(signed_out.status(), 200);
+    let after = s
+        .call(
+            "HostClientService/ListAccountHosts",
+            Some(&phone_cred),
+            json!({}),
+        )
+        .await;
+    assert_eq!(after.status(), 401);
+    assert!(s.host_ids(&pc_cred).await.contains(&pc_id));
+    let _ = phone_id;
+}
+
+#[tokio::test]
+async fn the_web_api_signs_in_and_manages_devices() {
+    let s = server().await;
+    s.setup(&browser()).await;
+    let b = browser();
+
+    let (status, body) = s.web(&b, "AccountService/GetMe", json!({})).await;
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (401, Some("unauthenticated"))
+    );
+    let (status, body) = s
+        .web(
+            &b,
+            "AuthService/SignIn",
+            json!({"username": "alice", "password": "wrong-password"}),
+        )
+        .await;
+    assert_eq!(status, 401);
+    assert_eq!(body["details"][0]["type"], "runner_server.v1.ErrorDetail");
+    assert_eq!(
+        body["details"][0]["value"], "CAE",
+        "ERROR_CODE_INVALID_CREDENTIALS"
+    );
+    let (status, body) = s
+        .web(
+            &b,
+            "AuthService/SignIn",
+            json!({"username": "alice", "password": "correct-horse", "captchaId": "", "captchaAnswer": ""}),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["user"]["username"], "alice");
+    assert_eq!(body["user"]["isAdmin"], true);
+    let (status, me) = s.web(&b, "AccountService/GetMe", json!({})).await;
+    assert_eq!(status, 200);
+    assert_eq!(me["user"]["id"], body["user"]["id"]);
+
+    for method in ["AuthService/GetCaptcha", "AuthService/Register"] {
+        assert_eq!(s.web(&b, method, json!({})).await.0, 501, "{method}");
+    }
+    let foreign = b
+        .post(format!(
+            "{}/api/runner_server.v1.HostService/ListHosts",
+            s.origin
+        ))
+        .header("Origin", "https://evil.example")
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(foreign.status(), 403, "cross-origin calls are rejected");
+    let form = b
+        .post(format!(
+            "{}/api/runner_server.v1.HostService/ListHosts",
+            s.origin
+        ))
+        .form(&[("a", "b")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(form.status(), 400, "only JSON bodies");
+
+    // A phone signs in in the official format and is approved through the API.
+    let start: Value = s
+        .rpc
+        .post(format!(
+            "{}/api/runner_server.v1.HostEnrollmentService/StartEnrollment",
+            s.origin
+        ))
+        .header("X-Forwarded-For", "198.51.100.1, 203.0.113.9")
+        .json(&json!({
+            "hostKey": STANDARD.encode([5; 32]),
+            "kind": "ENROLLMENT_KIND_CLIENT",
+            "client": {"name": "iPhone 17", "platform": "ios", "osVersion": "26.1", "runnerVersion": "1.2.0"},
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let user_code = start["userCode"].as_str().unwrap().to_lowercase();
+    let (status, found) = s
+        .web(
+            &b,
+            "HostService/LookupEnrollment",
+            json!({"userCode": user_code}),
+        )
+        .await;
+    assert_eq!(status, 200, "{found}");
+    let e = &found["enrollment"];
+    assert_eq!(e["kind"], "ENROLLMENT_KIND_CLIENT");
+    assert_eq!(e["client"]["name"], "iPhone 17");
+    assert_eq!(e["client"]["osVersion"], "26.1");
+    assert_eq!(e["requestingIp"], "203.0.113.9");
+    assert_eq!(e["fingerprint"], remote::fingerprint(&[5; 32]));
+    assert_eq!(
+        s.web(
+            &b,
+            "HostService/LookupEnrollment",
+            json!({"userCode": "BCDF-GHJK"})
+        )
+        .await
+        .0,
+        404
+    );
+    let (status, _) = s
+        .web(
+            &b,
+            "HostService/ApproveEnrollment",
+            json!({"userCode": user_code, "name": "Work phone"}),
+        )
+        .await;
+    assert_eq!(status, 200);
+    let poll: PollResponse = s
+        .call(
+            "HostEnrollmentService/PollEnrollment",
+            None,
+            json!({"deviceCode": start["deviceCode"]}),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(poll.state, EnrollmentState::Approved);
+    assert_eq!(poll.client_id, poll.host_id, "phones get a clientId");
+    let (phone_id, phone_cred) = (poll.host_id, poll.credential.0);
+
+    let (pc_id, pc_cred) = s.enroll(&b, "studio", 1).await;
+    let (_, hosts) = s.web(&b, "HostService/ListHosts", json!({})).await;
+    assert!(
+        hosts["hosts"].as_array().unwrap().is_empty(),
+        "listed once connected"
+    );
+    let (mut host, _) = s.host(&pc_cred).await;
+    let (_, hosts) = s.web(&b, "HostService/ListHosts", json!({})).await;
+    assert_eq!(hosts["hosts"].as_array().unwrap().len(), 1);
+    assert_eq!(hosts["hosts"][0]["id"], pc_id);
+    assert_eq!(hosts["hosts"][0]["online"], true);
+    let (_, clients) = s.web(&b, "HostService/ListClients", json!({})).await;
+    assert_eq!(clients["clients"][0]["id"], phone_id);
+    assert_eq!(
+        clients["clients"][0]["name"], "Work phone",
+        "named on approval"
+    );
+    assert_eq!(clients["clients"][0]["info"]["name"], "iPhone 17");
+
+    let mut route = s
+        .ws(
+            &format!("/relay/client?host={pc_id}"),
+            &phone_cred,
+            remote::CLIENT_SUBPROTOCOL,
+        )
+        .await
+        .unwrap();
+    let open = text(&mut host).await;
+    assert_eq!(open["device"]["kind"], "phone");
+    let (_, connections) = s.web(&b, "HostService/ListConnections", json!({})).await;
+    let c = &connections["connections"].as_array().unwrap()[..];
+    assert_eq!(c.len(), 1, "{connections}");
+    assert_eq!(c[0]["host"]["id"], pc_id);
+    assert_eq!(c[0]["host"]["online"], true);
+    assert_eq!(c[0]["phone"]["id"], phone_id);
+    assert!(c[0].get("computer").is_none());
+
+    let (status, _) = s
+        .web(
+            &b,
+            "HostService/RenameHost",
+            json!({"hostId": pc_id, "name": "desk"}),
+        )
+        .await;
+    assert_eq!(status, 200);
+    let (_, hosts) = s.web(&b, "HostService/ListHosts", json!({})).await;
+    assert_eq!(hosts["hosts"][0]["name"], "desk");
+    assert_eq!(
+        s.web(&b, "HostService/RemoveHost", json!({"hostId": phone_id}))
+            .await
+            .0,
+        404,
+        "RemoveHost does not remove phones"
+    );
+    let (status, _) = s
+        .web(
+            &b,
+            "HostService/RemoveClient",
+            json!({"clientId": phone_id}),
+        )
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        close_code(&mut route).await,
+        4003,
+        "the phone's route closes"
+    );
+    let closed = text(&mut host).await;
+    assert_eq!(closed["type"], "channelClosed");
+    let (_, connections) = s.web(&b, "HostService/ListConnections", json!({})).await;
+    assert!(connections["connections"].as_array().unwrap().is_empty());
+
+    let refreshed = b
+        .post(format!(
+            "{}/api/runner_server.v1.AuthService/Refresh",
+            s.origin
+        ))
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refreshed.status(), 200);
+    assert!(refreshed.headers().contains_key("set-cookie"));
+    assert_eq!(s.web(&b, "AuthService/SignOut", json!({})).await.0, 200);
+    assert_eq!(s.web(&b, "AccountService/GetMe", json!({})).await.0, 401);
+    assert_eq!(s.web(&b, "AuthService/Refresh", json!({})).await.0, 401);
+}
+
+#[tokio::test]
+async fn admins_manage_accounts_through_the_web_api() {
+    let s = server().await;
+    let admin = browser();
+    s.setup(&admin).await;
+    let (_, me) = s.web(&admin, "AccountService/GetMe", json!({})).await;
+    let alice = me["user"]["id"].as_str().unwrap().to_owned();
+
+    let bob_password = "bob-password";
+    let (status, created) = s
+        .web(
+            &admin,
+            "AdminService/CreateUser",
+            json!({"username": "bob", "displayName": "Bob", "password": bob_password}),
+        )
+        .await;
+    assert_eq!(status, 200, "{created}");
+    let bob = created["user"]["id"].as_str().unwrap().to_owned();
+    let (status, taken) = s
+        .web(
+            &admin,
+            "AdminService/CreateUser",
+            json!({"username": "BOB", "password": bob_password}),
+        )
+        .await;
+    assert_eq!(
+        (status, taken["code"].as_str()),
+        (409, Some("already_exists"))
+    );
+    assert_eq!(
+        s.web(
+            &admin,
+            "AdminService/CreateUser",
+            json!({"username": "carol", "password": "short"})
+        )
+        .await
+        .0,
+        400
+    );
+
+    let b = browser();
+    let sign_in = |password: &'static str| {
+        let (s, b) = (&s, &b);
+        async move {
+            s.web(
+                b,
+                "AuthService/SignIn",
+                json!({"username": "bob", "password": password}),
+            )
+            .await
+        }
+    };
+    assert_eq!(sign_in(bob_password).await.0, 200);
+    let (status, body) = s.web(&b, "AdminService/ListUsers", json!({})).await;
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (403, Some("permission_denied"))
+    );
+
+    let (_, users) = s.web(&admin, "AdminService/ListUsers", json!({})).await;
+    let users = users["users"].as_array().unwrap().clone();
+    assert_eq!(users.len(), 2);
+    let row = users
+        .iter()
+        .find(|u| u["user"]["id"] == bob.as_str())
+        .unwrap();
+    assert_eq!(row["status"], "USER_STATUS_ACTIVE");
+    assert!(row["lastLoginAt"].is_string(), "{row}");
+
+    let (status, body) = s
+        .web(
+            &admin,
+            "AdminService/DeactivateUser",
+            json!({"userId": alice}),
+        )
+        .await;
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (400, Some("failed_precondition"))
+    );
+
+    let (status, reset) = s
+        .web(&admin, "AdminService/ResetPassword", json!({"userId": bob}))
+        .await;
+    assert_eq!(status, 200);
+    let temporary = reset["temporaryPassword"].as_str().unwrap().to_owned();
+    assert_eq!(
+        s.web(&b, "AccountService/GetMe", json!({})).await.0,
+        401,
+        "signed out"
+    );
+    let temporary: &'static str = Box::leak(temporary.into_boxed_str());
+    assert_eq!(sign_in(temporary).await.0, 200);
+    let (status, _) = s
+        .web(
+            &b,
+            "AccountService/ChangePassword",
+            json!({"currentPassword": temporary, "newPassword": bob_password}),
+        )
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        s.web(&b, "AccountService/GetMe", json!({})).await.0,
+        200,
+        "keeps this session"
+    );
+
+    assert_eq!(
+        s.web(
+            &admin,
+            "AdminService/DeactivateUser",
+            json!({"userId": bob})
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(s.web(&b, "AccountService/GetMe", json!({})).await.0, 401);
+    let (status, body) = sign_in(bob_password).await;
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (403, Some("permission_denied"))
+    );
+    assert_eq!(
+        s.web(
+            &admin,
+            "AdminService/ReactivateUser",
+            json!({"userId": bob})
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(sign_in(bob_password).await.0, 200);
+
+    assert_eq!(
+        s.web(
+            &admin,
+            "AdminService/SetAdmin",
+            json!({"userId": bob, "isAdmin": true})
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(
+        s.web(&b, "AdminService/ListUsers", json!({})).await.0,
+        200,
+        "bob is an admin"
+    );
+    assert_eq!(
+        s.web(&admin, "AdminService/DeleteUser", json!({"userId": bob}))
+            .await
+            .0,
+        200
+    );
+    let (_, users) = s.web(&admin, "AdminService/ListUsers", json!({})).await;
+    assert_eq!(users["users"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        s.web(&admin, "AdminService/DeleteUser", json!({"userId": bob}))
+            .await
+            .0,
+        404
+    );
+    assert_eq!(
+        s.web(&admin, "AdminService/CreateInvite", json!({}))
+            .await
+            .0,
+        501
+    );
 }

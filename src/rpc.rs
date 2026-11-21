@@ -26,6 +26,7 @@ pub fn routes() -> Router<AppState> {
         .route(&format!("{ENROLL}/StartEnrollment"), post(start))
         .route(&format!("{ENROLL}/PollEnrollment"), post(poll))
         .route(&format!("{ENROLL}/SignOutHost"), post(sign_out))
+        .route(&format!("{ENROLL}/SignOutClient"), post(sign_out_client))
         .route(&format!("{CLIENT}/ListAccountHosts"), post(list_hosts))
 }
 
@@ -108,16 +109,20 @@ pub fn decode_host_key(key: &str) -> Option<Vec<u8>> {
     protocol::decode_key(key)
 }
 
-async fn start(State(state): State<AppState>, body: Bytes) -> RpcResult<StartResponse> {
+async fn start(
+    State(state): State<AppState>,
+    auth::ClientIp(requesting_ip): auth::ClientIp,
+    body: Bytes,
+) -> RpcResult<StartResponse> {
     let request: StartRequest = parse(&body)?;
     if decode_host_key(&request.host_key).is_none() {
         return Err(RpcError::invalid(
             "hostKey must be a base64 32-byte public key.",
         ));
     }
-    let info = sanitize(request.host);
-    let host_key = request.host_key;
+    let host_key = request.host_key.clone();
     let kind = request.kind;
+    let info = sanitize(request.device_info());
     let device_code = auth::random_token();
     let device_hash = auth::sha256_hex(&device_code);
     let now = now();
@@ -137,6 +142,9 @@ async fn start(State(state): State<AppState>, body: Bytes) -> RpcResult<StartRes
                     user_id: None,
                     expires_at: now + ENROLLMENT_TTL,
                     kind,
+                    requesting_ip: requesting_ip.clone(),
+                    name: String::new(),
+                    created_at: now,
                 };
                 if db::insert_enrollment(c, &enrollment, now)? {
                     return Ok(Some(enrollment.user_code));
@@ -171,6 +179,7 @@ enum Polled {
         user: db::User,
         claim_expires_at: i64,
         replaced: Vec<i64>,
+        kind: DeviceKind,
     },
 }
 
@@ -218,7 +227,9 @@ async fn poll(State(state): State<AppState>, body: Bytes) -> RpcResult<PollRespo
                                 };
                                 let credential = auth::credential();
                                 let key = decode_host_key(&e.host_key).unwrap_or_default();
-                                let name = if e.info.hostname.is_empty() {
+                                let name = if !e.name.is_empty() {
+                                    e.name.clone()
+                                } else if e.info.hostname.is_empty() {
                                     match e.kind {
                                         DeviceKind::Computer => "Unnamed computer",
                                         DeviceKind::Phone => "Unnamed phone",
@@ -249,6 +260,7 @@ async fn poll(State(state): State<AppState>, body: Bytes) -> RpcResult<PollRespo
                                     user,
                                     claim_expires_at,
                                     replaced,
+                                    kind: e.kind,
                                 }
                             }
                         }
@@ -272,6 +284,7 @@ async fn poll(State(state): State<AppState>, body: Bytes) -> RpcResult<PollRespo
             user,
             claim_expires_at,
             replaced,
+            kind,
         } => {
             for id in replaced {
                 state.hub.kick(id, relay::CLOSE_REMOVED, "re-enrolled");
@@ -287,6 +300,10 @@ async fn poll(State(state): State<AppState>, body: Bytes) -> RpcResult<PollRespo
                     display_name: user.display_name,
                 }),
                 claim_expires_at: rfc3339(claim_expires_at),
+                client_id: match kind {
+                    DeviceKind::Phone => host_id.to_string(),
+                    DeviceKind::Computer => String::new(),
+                },
             }
         }
     }))
@@ -327,6 +344,22 @@ async fn sign_out(State(state): State<AppState>, headers: HeaderMap) -> RpcResul
         .ok_or_else(RpcError::unauthenticated)?;
     state.hub.kick(host, relay::CLOSE_REMOVED, "signed out");
     tracing::info!(host, "host signed out");
+    Ok(Json(Empty {}))
+}
+
+/// The official service's sign-out for phones; only a phone's credential may use it.
+async fn sign_out_client(State(state): State<AppState>, headers: HeaderMap) -> RpcResult<Empty> {
+    let (me, _) = authenticate(&state, &headers).await?;
+    if me.kind != DeviceKind::Phone {
+        return Err(RpcError::new(
+            StatusCode::FORBIDDEN,
+            "permission_denied",
+            "This credential is not a phone's.",
+        ));
+    }
+    let id = me.id;
+    state.db.call(move |c| db::delete_host(c, id, None)).await?;
+    tracing::info!(host = id, "phone signed out");
     Ok(Json(Empty {}))
 }
 

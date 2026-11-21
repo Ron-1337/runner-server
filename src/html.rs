@@ -46,7 +46,7 @@ header{background:#fff;border-bottom:1px solid #e3e6ea}header .in{max-width:960p
 header b{font-size:16px;margin-right:auto}header a{color:#1f2328;text-decoration:none}header a:hover{text-decoration:underline}
 main{max-width:960px;margin:28px auto;padding:0 20px}.card{background:#fff;border:1px solid #e3e6ea;border-radius:10px;padding:22px;margin-bottom:20px}
 h1{font-size:22px;margin:0 0 16px}h2{font-size:17px;margin:0 0 12px}
-label{display:block;margin:12px 0 4px;font-weight:600}input[type=text],input[type=password]{width:100%;max-width:380px;padding:8px 10px;border:1px solid #cfd4da;border-radius:6px;font:inherit}
+label{display:block;margin:12px 0 4px;font-weight:600}input[type=text],input[type=password],select{width:100%;max-width:380px;padding:8px 10px;border:1px solid #cfd4da;border-radius:6px;font:inherit}
 button{padding:7px 14px;border:1px solid #cfd4da;border-radius:6px;background:#fff;font:inherit;cursor:pointer}button.primary{background:#1f6feb;border-color:#1f6feb;color:#fff}button.danger{color:#cf222e}
 form.inline{display:inline}table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:8px 6px;border-bottom:1px solid #eef0f2;vertical-align:top}
 .notice{padding:10px 14px;border-radius:6px;margin-bottom:18px}.ok{background:#dafbe1;color:#116329}.err{background:#ffebe9;color:#a40e26}

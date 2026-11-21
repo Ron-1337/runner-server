@@ -15,6 +15,7 @@ runner remote login --server https://runner.example.com
 - 管理员在“用户管理”中添加用户、重置密码、设为或取消管理员、停用、删除。停用或删除会立即断开该用户的所有电脑。
 - 每个用户只能看到和连接自己账号下的电脑。
 - “我的电脑”：查看在线状态和指纹，移除电脑。
+- 手机通知：在“我的电脑”中点手机的“通知设置”，配置推送通道（目前支持 Bark，可用官方服务器或自建 bark-server），可发送测试通知。会话需要处理时，电脑只通知最后连接这个会话的设备；是手机时由本服务通过它的通道推送，点开通知会用 `runner-remote://` 链接在 Runner Remote 中打开这个会话。
 
 ## 构建
 
@@ -102,12 +103,33 @@ location / {
 
 | 路径 | 说明 |
 | --- | --- |
-| `POST /api/runner_server.v1.HostEnrollmentService/StartEnrollment` | 开始登录，返回 device code 与 user code（10 分钟有效）。可选字段 `"kind": "phone"` 表示手机：批准后立即可用，不出现在 `ListAccountHosts` 中，不能连 `/relay/host`，也不能作为连接目标；Runner 不发送该字段，按电脑处理 |
-| `POST /api/runner_server.v1.HostEnrollmentService/PollEnrollment` | 轮询；批准后签发 `rhc_` 凭据（只返回一次），10 分钟内需连上中继 |
+| `POST /api/runner_server.v1.HostEnrollmentService/StartEnrollment` | 开始登录，返回 device code 与 user code（10 分钟有效）。手机按官方格式发 `"kind": "ENROLLMENT_KIND_CLIENT"`（或 `2`）和 `client`（`name`、`platform`、`osVersion`、`runnerVersion`）；旧的 `"kind": "phone"` 加 `host` 仍然接受。手机批准后立即可用，不出现在 `ListAccountHosts` 中，不能连 `/relay/host`，也不能作为连接目标；Runner 不发送 `kind`，按电脑处理 |
+| `POST /api/runner_server.v1.HostEnrollmentService/PollEnrollment` | 轮询；批准后签发 `rhc_` 凭据（只返回一次），10 分钟内需连上中继。手机还会收到 `clientId`（与 `hostId` 相同） |
 | `POST /api/runner_server.v1.HostEnrollmentService/SignOutHost` | 电脑注销 |
+| `POST /api/runner_server.v1.HostEnrollmentService/SignOutClient` | 手机注销，只接受手机的凭据 |
 | `POST /api/runner_server.v1.HostClientService/ListAccountHosts` | 同账号电脑列表 |
 | `GET /relay/host`（`runner-relay.v1`） | 电脑常驻连接；`hello` → `welcome`，二进制帧带 4 字节大端通道号 |
 | `GET /relay/client?host=<id>`（`runner-client.v1`） | 打开一条到同账号电脑的通道，帧原样转发 |
+
+### 网页端 API
+
+与官方 Runner Hub 相同的 Connect RPC（JSON），路径为 `POST /api/runner_server.v1.<服务>/<方法>`，`Content-Type: application/json`，用网页登录的 Cookie 认证；带 `Origin` 头时必须与 `--origin` 一致。出错时返回 Connect 错误 JSON，`details` 里带 `runner_server.v1.ErrorDetail`（官方的 `ErrorCode`）。现有的 HTML 页面照常可用。
+
+| 服务 | 方法 |
+| --- | --- |
+| `AuthService` | `SignIn`（`username`、`password`，不需要验证码）、`Refresh`、`SignOut`、`SignOutEverywhere` |
+| `AccountService` | `GetMe`、`ChangePassword` |
+| `HostService` | `ListHosts`、`ListClients`、`ListConnections`、`RenameHost`、`RemoveHost`、`RemoveClient`、`LookupEnrollment`、`ApproveEnrollment`（可带 `name` 给设备命名）、`DenyEnrollment` |
+| `AdminService`（管理员） | `ListUsers`、`DeactivateUser`、`ReactivateUser`、`ResetPassword`（返回临时密码），以及本服务的扩展 `CreateUser`（`username`、`displayName`、`password`、`isAdmin`）、`SetAdmin`（`userId`、`isAdmin`）、`DeleteUser`（`userId`） |
+
+本服务没有验证码、自助注册和邀请码，账号只能由管理员创建：`AuthService/GetCaptcha`、`AuthService/Register`、`AdminService/CreateInvite`、`ListInvites`、`RevokeInvite` 返回 `unimplemented`。首次初始化仍在网页 `/setup` 完成。管理员不能对自己执行停用、重置密码、改角色和删除。`LookupEnrollment` 显示的请求来源 IP 只在连接来自本机（反向代理）时才采用 `X-Forwarded-For`。
+
+本服务对中继控制消息的扩展（Runner 原版会忽略）：
+
+| 消息 | 方向 | 说明 |
+| --- | --- | --- |
+| `{"type":"channelOpen","channel":17,"device":{"id":"…","kind":"phone"}}` | 服务 → 电脑 | 多了 `device`：打开通道的设备 |
+| `{"type":"notify","device":"…","session":"…","title":"…","body":"…"}` | 电脑 → 服务 | 通知同账号的一部手机；服务按该手机的通道推送，并附上打开该会话的链接。每个电脑连接每分钟最多 30 条 |
 
 关闭码：4001 同一凭据在别处连接，4003 电脑被移除、账号被停用或删除，4413 通道队列超过 1 MiB，1012 服务重启。服务每 25 秒发送 ping，60 秒无数据断开连接。
 
