@@ -314,7 +314,7 @@ async fn hosts_page(
         .db
         .call(move |c| db::hosts_for_user(c, user_id))
         .await?;
-    let mut rows = String::new();
+    let (mut computers, mut phones) = (String::new(), String::new());
     for h in &hosts {
         let phone = h.kind == DeviceKind::Phone;
         let online = state.hub.connected_at(h.id);
@@ -337,6 +337,7 @@ async fn hosts_page(
                     .unwrap_or_default()
             ),
         };
+        let rows = if phone { &mut phones } else { &mut computers };
         rows.push_str(&format!(
             r#"<tr><td><b>{name}</b><div class="muted">{platform} {arch} · {os} · Runner {version}</div></td>
 <td class="mono">{fp}</td><td>{status}</td><td>{created}</td>
@@ -358,30 +359,43 @@ async fn hosts_page(
             id = h.id,
         ));
     }
-    let table = if hosts.is_empty() {
-        r#"<p class="muted">还没有电脑。在电脑上运行下面的命令登录到本服务。</p>"#.to_owned()
-    } else {
-        format!(
-            "<table><tr><th>电脑</th><th>指纹</th><th>状态</th><th>添加时间</th><th></th></tr>{rows}</table>"
-        )
+    let table = |rows: &str, kind: &str, empty: &str| {
+        if rows.is_empty() {
+            format!(r#"<p class="muted">{empty}</p>"#)
+        } else {
+            format!(
+                "<table><tr><th>{kind}</th><th>指纹</th><th>状态</th><th>添加时间</th><th></th></tr>{rows}</table>"
+            )
+        }
     };
+    let computers = table(
+        &computers,
+        "电脑",
+        "还没有电脑。在电脑上运行下面的命令登录到本服务。",
+    );
+    let phones = table(
+        &phones,
+        "手机",
+        "还没有手机。在 Runner Remote App 中输入本服务的地址登录。",
+    );
     let notice = match q.ok.as_deref() {
-        Some("removed") => Notice::ok("已移除该电脑。"),
-        Some("renamed") => Notice::ok(
-            "已改名。其他 Runner 刷新电脑列表后会显示新名字；这台电脑自己下次连接服务时更新。",
-        ),
+        Some("removed") => Notice::ok("已移除该设备。"),
+        Some("renamed") => {
+            Notice::ok("已改名。其他设备刷新列表后会显示新名字；这台设备自己下次连接服务时更新。")
+        }
         Some("bad-name") => Notice::err("名字不能为空，且不超过 64 个字符。"),
         _ => None,
     };
     Ok(page(
-        "我的电脑",
+        "设备管理",
         Some(&me.user),
         notice,
         &format!(
-            r#"<div class="card"><h1>我的电脑</h1>{table}</div>
+            r#"<div class="card"><h1>设备管理</h1><h2>电脑</h2>{computers}<h2 style="margin-top:24px">手机</h2>{phones}</div>
 <div class="card"><h2>连接一台电脑</h2><p>在要连接的电脑上运行：</p>
 <p><code>runner remote login --server {origin}</code></p>
-<p class="muted">命令会显示一个链接和代码，在浏览器中打开链接并批准即可。每台要控制别的电脑或被控制的电脑都需要登录一次。</p></div>"#,
+<p class="muted">命令会显示一个链接和代码，在浏览器中打开链接并批准即可。每台要控制别的电脑或被控制的电脑都需要登录一次。</p></div>
+<div class="card"><h2>连接一部手机</h2><p>在 Runner Remote App 中输入服务器地址 <code>{origin}</code> 并登录，然后在打开的页面中批准。</p></div>"#,
             origin = e(&state.config.origin)
         ),
     )
@@ -448,16 +462,74 @@ struct CodeQuery {
 /// so the page cannot be made to redirect anywhere else.
 pub const APP_CALLBACK: &str = "runner-remote-auth://enrollment";
 
+/// Eight boxes, four and four around a dash. Typing moves to the next box,
+/// backspace to the previous one, and a pasted code fills them all; letters
+/// become capitals. The script fills the hidden `code` field the form sends.
+const CODE_FORM: &str = r#"<div class="card"><h1>添加设备</h1><form method="get" action="/hosts/add" id="code-form">
+<label>输入电脑或手机上显示的代码</label>
+<input type="hidden" name="code" id="code">
+<div class="boxes" id="boxes">
+<input class="box" aria-label="第 1 位" autofocus><input class="box" aria-label="第 2 位"><input class="box" aria-label="第 3 位"><input class="box" aria-label="第 4 位">
+<span class="dash">-</span>
+<input class="box" aria-label="第 5 位"><input class="box" aria-label="第 6 位"><input class="box" aria-label="第 7 位"><input class="box" aria-label="第 8 位">
+</div>
+<noscript><input type="text" name="code" placeholder="XXXX-XXXX" autocomplete="off"></noscript>
+<p><button class="primary">继续</button></p></form></div>
+<script>
+(() => {
+  const boxes = [...document.querySelectorAll('#boxes .box')];
+  const clean = (text) => text.toUpperCase().replace(/[^A-Z0-9]/g, '');
+  for (const box of boxes) {
+    box.maxLength = 8;
+    box.autocomplete = 'off';
+    box.autocapitalize = 'characters';
+    box.spellcheck = false;
+  }
+  const fill = (from, text) => {
+    let i = from;
+    for (const ch of clean(text)) {
+      if (i >= boxes.length) break;
+      boxes[i++].value = ch;
+    }
+    boxes[Math.min(i, boxes.length - 1)].focus();
+  };
+  boxes.forEach((box, i) => {
+    box.addEventListener('input', () => {
+      const text = clean(box.value);
+      box.value = '';
+      if (text) fill(i, text);
+    });
+    box.addEventListener('keydown', (event) => {
+      if (event.key === 'Backspace' && !box.value && i > 0) {
+        boxes[i - 1].value = '';
+        boxes[i - 1].focus();
+        event.preventDefault();
+      } else if (event.key === 'ArrowLeft' && i > 0) {
+        boxes[i - 1].focus();
+      } else if (event.key === 'ArrowRight' && i < boxes.length - 1) {
+        boxes[i + 1].focus();
+      }
+    });
+    box.addEventListener('paste', (event) => {
+      event.preventDefault();
+      fill(i, event.clipboardData.getData('text'));
+    });
+    box.addEventListener('focus', () => box.select());
+  });
+  document.getElementById('code-form').addEventListener('submit', (event) => {
+    const code = boxes.map((b) => b.value).join('');
+    if (code.length !== 8) {
+      event.preventDefault();
+      boxes[Math.min(code.length, 7)].focus();
+      return;
+    }
+    document.getElementById('code').value = code.slice(0, 4) + '-' + code.slice(4);
+  });
+})();
+</script>"#;
+
 fn code_form(user: &db::User, notice: Option<Notice>) -> Response {
-    page(
-        "添加电脑",
-        Some(user),
-        notice,
-        r#"<div class="card"><h1>添加电脑</h1><form method="get" action="/hosts/add">
-<label>输入电脑上显示的代码</label><input type="text" name="code" placeholder="XXXX-XXXX" required autofocus autocomplete="off">
-<p><button class="primary">继续</button></p></form></div>"#,
-    )
-    .into_response()
+    page("添加设备", Some(user), notice, CODE_FORM).into_response()
 }
 
 async fn add_page(
@@ -577,7 +649,7 @@ async fn add_submit(
     let (title, message) = if approve {
         (
             "已批准",
-            "已批准。请回到电脑终端或手机 App 确认账号，完成后它会出现在“我的电脑”中。",
+            "已批准。请回到电脑终端或手机 App 确认账号，完成后它会出现在“设备管理”中。",
         )
     } else {
         ("已拒绝", "已拒绝这次登录请求。")
@@ -586,7 +658,7 @@ async fn add_submit(
         title,
         Some(&me.user),
         Notice::ok(message),
-        r#"<p><a href="/hosts">返回我的电脑</a></p>"#,
+        r#"<p><a href="/hosts">返回设备管理</a></p>"#,
     )
     .into_response())
 }
@@ -814,7 +886,7 @@ fn not_found(user: &db::User) -> Response {
             "找不到",
             Some(user),
             Notice::err("找不到这部手机。"),
-            r#"<p><a href="/hosts">返回我的电脑</a></p>"#,
+            r#"<p><a href="/hosts">返回设备管理</a></p>"#,
         ),
     )
         .into_response()
@@ -875,7 +947,7 @@ fn notify_form(
 <label>中断级别</label><select name="level">{levels}</select>
 <p><button class="primary">保存</button></p></form>
 <form method="post" action="/hosts/{id}/notify/test"><button{test_disabled}>发送测试通知</button></form>
-<p><a href="/hosts">返回我的电脑</a></p></div>"#,
+<p><a href="/hosts">返回设备管理</a></p></div>"#,
             name = e(&phone.name),
             id = phone.id,
             bark_selected = if enabled { " selected" } else { "" },

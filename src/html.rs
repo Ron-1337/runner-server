@@ -54,12 +54,15 @@ form.inline{display:inline}table{width:100%;border-collapse:collapse}th,td{text-
 .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px}.on{background:#1a7f37}.off{background:#afb8c1}
 .tag{display:inline-block;padding:1px 8px;border-radius:10px;background:#ddf4ff;color:#0969da;font-size:13px}
 .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.boxes{display:flex;gap:6px;align-items:center;flex-wrap:nowrap}.boxes .box{width:2.4em;height:2.8em;padding:0;text-align:center;font:600 20px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;text-transform:uppercase;border:1px solid #cfd4da;border-radius:6px}
+.boxes .box:focus{outline:2px solid #1f6feb;border-color:#1f6feb}.boxes .dash{font-size:22px;color:#656d76;padding:0 2px}
+@media(max-width:420px){.boxes{gap:4px}.boxes .box{width:2em;height:2.4em;font-size:17px}}
 "#;
 
 pub fn page(title: &str, user: Option<&User>, notice: Option<Notice>, body: &str) -> Html<String> {
     let nav = match user {
         Some(u) => format!(
-            r#"<a href="/hosts">我的电脑</a><a href="/hosts/add">添加电脑</a>{}<a href="/account">{}</a>
+            r#"<a href="/hosts">设备管理</a><a href="/hosts/add">添加设备</a>{}<a href="/account">{}</a>
 <form class="inline" method="post" action="/logout"><button>退出</button></form>"#,
             if u.is_admin {
                 r#"<a href="/admin/users">用户管理</a>"#

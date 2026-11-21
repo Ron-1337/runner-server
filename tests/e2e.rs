@@ -1475,3 +1475,75 @@ async fn the_approval_page_returns_to_the_phone_app() {
         .unwrap();
     assert!(!page.contains(r#"name="app""#));
 }
+
+#[tokio::test]
+async fn device_management_lists_phones_apart_and_takes_the_code_in_boxes() {
+    let s = server().await;
+    let admin = browser();
+    s.setup(&admin).await;
+    let start: StartResponse = s
+        .call(
+            "HostEnrollmentService/StartEnrollment",
+            None,
+            json!({
+                "kind": "ENROLLMENT_KIND_CLIENT",
+                "client": {"name": "Pixel 9", "platform": "android"},
+                "hostKey": STANDARD.encode([8; 32]),
+            }),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    // Lower case and no dash are accepted.
+    let code = start.user_code.replace('-', "").to_lowercase();
+    let page = admin
+        .get(format!("{}/hosts/add?code={code}", s.origin))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(page.contains("批准这部手机"), "{page}");
+    s.form(
+        &admin,
+        "/hosts/add",
+        &[("code", &start.user_code), ("decision", "approve")],
+    )
+    .await;
+    // The phone is added once it collects its credential.
+    s.call(
+        "HostEnrollmentService/PollEnrollment",
+        None,
+        json!({"deviceCode": start.device_code.0}),
+    )
+    .await;
+
+    let hosts = admin
+        .get(format!("{}/hosts", s.origin))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(hosts.contains("<h1>设备管理</h1>"), "{hosts}");
+    let (computers, phones) = hosts
+        .split_once("<h2 style=\"margin-top:24px\">手机</h2>")
+        .unwrap();
+    assert!(computers.contains("还没有电脑"));
+    assert!(phones.contains("Pixel 9"));
+
+    let form = admin
+        .get(format!("{}/hosts/add", s.origin))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(form.contains("<h1>添加设备</h1>"));
+    assert_eq!(form.matches(r#"class="box""#).count(), 8);
+    assert!(form.contains(r#"<span class="dash">-</span>"#));
+}
