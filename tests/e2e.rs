@@ -1347,3 +1347,53 @@ async fn admins_manage_accounts_through_the_web_api() {
         501
     );
 }
+
+#[tokio::test]
+async fn the_approval_page_names_the_device() {
+    let s = server().await;
+    let admin = browser();
+    s.setup(&admin).await;
+    let start: StartResponse = s
+        .call(
+            "HostEnrollmentService/StartEnrollment",
+            None,
+            json!({"host": {"hostname": "localhost"}, "hostKey": STANDARD.encode([6; 32])}),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    let page = admin
+        .get(&start.verification_uri_complete)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(page.contains(r#"name="name" value="localhost""#), "{page}");
+    let approved = s
+        .form(
+            &admin,
+            "/hosts/add",
+            &[
+                ("code", &start.user_code),
+                ("decision", "approve"),
+                ("name", " Desk "),
+            ],
+        )
+        .await;
+    assert!(approved.text().await.unwrap().contains("已批准"));
+    let poll: PollResponse = s
+        .call(
+            "HostEnrollmentService/PollEnrollment",
+            None,
+            json!({"deviceCode": start.device_code.0}),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    let (_socket, welcome) = s.host(&poll.credential.0).await;
+    assert_eq!(welcome["name"], "Desk");
+}

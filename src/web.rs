@@ -495,8 +495,9 @@ async fn add_page(
 <tr><th>请求来源</th><td class="mono">{ip}</td></tr>
 <tr><th>有效期至</th><td>{expires}</td></tr></table>
 <p class="muted">请确认代码和指纹与{shown_on}中显示的一致。批准后这{noun}会加入账号 <b>{account}</b>。</p>
-<form method="post" action="/hosts/add" class="row"><input type="hidden" name="code" value="{code}">
-<button class="primary" name="decision" value="approve">批准</button><button name="decision" value="deny">拒绝</button></form></div>"#,
+<form method="post" action="/hosts/add"><input type="hidden" name="code" value="{code}">
+<label>设备名称</label><input type="text" name="name" value="{name}" maxlength="64" autocomplete="off">
+<p class="row"><button class="primary" name="decision" value="approve">批准</button><button name="decision" value="deny">拒绝</button></p></form></div>"#,
             code = e(&en.user_code),
             name = e(&en.info.hostname),
             platform = e(&en.info.platform),
@@ -516,6 +517,9 @@ async fn add_page(
 struct DecisionForm {
     code: String,
     decision: String,
+    /// The device's name as approved; empty keeps the name it sent.
+    #[serde(default)]
+    name: String,
 }
 
 async fn add_submit(
@@ -527,10 +531,23 @@ async fn add_submit(
         return Ok(code_form(&me.user, Notice::err("代码格式不正确。")));
     };
     let approve = form.decision == "approve";
+    let name = match form.name.trim() {
+        _ if !approve => None,
+        "" => None,
+        raw => match clean_host_name(raw) {
+            Some(name) => Some(name),
+            None => {
+                return Ok(code_form(
+                    &me.user,
+                    Notice::err("设备名称不超过 64 个字符。"),
+                ));
+            }
+        },
+    };
     let user_id = me.user.id;
     let decided = state
         .db
-        .call(move |c| db::decide_enrollment(c, &code, approve, user_id, None, now()))
+        .call(move |c| db::decide_enrollment(c, &code, approve, user_id, name.as_deref(), now()))
         .await?;
     if !decided {
         return Ok(code_form(
