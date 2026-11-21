@@ -1,4 +1,4 @@
-use crate::protocol::HostInfo;
+use crate::protocol::{DeviceKind, HostInfo};
 use anyhow::Result;
 use rusqlite::{Connection, ErrorCode, OptionalExtension, Row, params};
 use std::{
@@ -49,6 +49,28 @@ CREATE INDEX IF NOT EXISTS hosts_user ON hosts(user_id);
 CREATE INDEX IF NOT EXISTS hosts_key ON hosts(host_key);
 "#;
 
+/// Columns added after the first release, as (table, column, definition).
+const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
+    ("enrollments", "kind", "TEXT NOT NULL DEFAULT 'computer'"),
+    ("hosts", "kind", "TEXT NOT NULL DEFAULT 'computer'"),
+];
+
+fn migrate(c: &Connection) -> Result<()> {
+    for (table, column, definition) in ADDED_COLUMNS {
+        let present: bool = c.query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info(?1) WHERE name = ?2",
+            params![table, column],
+            |r| r.get(0),
+        )?;
+        if !present {
+            c.execute_batch(&format!(
+                "ALTER TABLE {table} ADD COLUMN {column} {definition}"
+            ))?;
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct Db(Arc<Mutex<Connection>>);
 
@@ -58,6 +80,7 @@ impl Db {
         conn.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))?;
         conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;")?;
         conn.execute_batch(SCHEMA)?;
+        migrate(&conn)?;
         Ok(Self(Arc::new(Mutex::new(conn))))
     }
 
@@ -232,9 +255,11 @@ pub struct Enrollment {
     pub state: String,
     pub user_id: Option<i64>,
     pub expires_at: i64,
+    pub kind: DeviceKind,
 }
 
-const ENROLLMENT_COLS: &str = "device_hash, user_code, host_key, info, state, user_id, expires_at";
+const ENROLLMENT_COLS: &str =
+    "device_hash, user_code, host_key, info, state, user_id, expires_at, kind";
 
 fn enrollment_row(r: &Row) -> rusqlite::Result<Enrollment> {
     Ok(Enrollment {
@@ -245,13 +270,14 @@ fn enrollment_row(r: &Row) -> rusqlite::Result<Enrollment> {
         state: r.get(4)?,
         user_id: r.get(5)?,
         expires_at: r.get(6)?,
+        kind: DeviceKind::parse(&r.get::<_, String>(7)?),
     })
 }
 
 pub fn insert_enrollment(c: &Connection, e: &Enrollment, now: i64) -> Result<bool> {
     match c.execute(
-        "INSERT INTO enrollments (device_hash, user_code, host_key, info, state, user_id, created_at, expires_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        "INSERT INTO enrollments (device_hash, user_code, host_key, info, state, user_id, created_at, expires_at, kind)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
             e.device_hash,
             e.user_code,
@@ -260,7 +286,8 @@ pub fn insert_enrollment(c: &Connection, e: &Enrollment, now: i64) -> Result<boo
             e.state,
             e.user_id,
             now,
-            e.expires_at
+            e.expires_at,
+            e.kind.as_str()
         ],
     ) {
         Ok(_) => Ok(true),
@@ -333,6 +360,7 @@ pub struct Host {
     pub claim_expires_at: i64,
     pub created_at: i64,
     pub last_seen_at: Option<i64>,
+    pub kind: DeviceKind,
 }
 
 impl Host {
@@ -341,7 +369,9 @@ impl Host {
     }
 }
 
-const HOST_COLS: &str = "h.id, h.user_id, h.name, h.info, h.fingerprint, h.activated, h.claim_expires_at, h.created_at, h.last_seen_at";
+const HOST_COLS: &str = "h.id, h.user_id, h.name, h.info, h.fingerprint, h.activated, h.claim_expires_at, h.created_at, h.last_seen_at, h.kind";
+/// Column index where a row's joined user columns start after `HOST_COLS`.
+const AFTER_HOST: usize = 10;
 
 fn host_at(r: &Row, at: usize) -> rusqlite::Result<Host> {
     Ok(Host {
@@ -354,6 +384,7 @@ fn host_at(r: &Row, at: usize) -> rusqlite::Result<Host> {
         claim_expires_at: r.get(at + 6)?,
         created_at: r.get(at + 7)?,
         last_seen_at: r.get(at + 8)?,
+        kind: DeviceKind::parse(&r.get::<_, String>(at + 9)?),
     })
 }
 
@@ -366,6 +397,7 @@ pub struct NewHost<'a> {
     pub fingerprint: &'a str,
     pub credential_hash: &'a str,
     pub claim_expires_at: i64,
+    pub kind: DeviceKind,
 }
 
 pub fn host_exists(c: &Connection, id: i64) -> Result<bool> {
@@ -376,10 +408,12 @@ pub fn host_exists(c: &Connection, id: i64) -> Result<bool> {
     )
 }
 
+/// A phone never connects to `/relay/host`, which is what activates a computer,
+/// so it is active from the start and is not purged when its claim expires.
 pub fn insert_host(c: &Connection, h: &NewHost, now: i64) -> Result<()> {
     c.execute(
-        "INSERT INTO hosts (id, user_id, name, info, host_key, fingerprint, credential_hash, claim_expires_at, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        "INSERT INTO hosts (id, user_id, name, info, host_key, fingerprint, credential_hash, claim_expires_at, created_at, kind, activated)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
             h.id,
             h.user_id,
@@ -389,7 +423,9 @@ pub fn insert_host(c: &Connection, h: &NewHost, now: i64) -> Result<()> {
             h.fingerprint,
             h.credential_hash,
             h.claim_expires_at,
-            now
+            now,
+            h.kind.as_str(),
+            h.kind == DeviceKind::Phone
         ],
     )?;
     Ok(())
@@ -402,7 +438,7 @@ pub fn host_by_credential(c: &Connection, credential_hash: &str) -> Result<Optio
              WHERE h.credential_hash = ?1"
         ),
         [credential_hash],
-        |r| Ok((host_at(r, 0)?, user_at(r, 9)?)),
+        |r| Ok((host_at(r, 0)?, user_at(r, AFTER_HOST)?)),
     )
     .optional()?)
 }

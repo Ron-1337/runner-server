@@ -43,11 +43,46 @@ pub struct Account {
     pub display_name: String,
 }
 
+/// What kind of device is enrolling. Not part of Runner's protocol: Runner never
+/// sends it, so its enrollments are computers. A phone (the Runner Remote app)
+/// only opens client routes, so it is never listed as a computer to connect to.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum DeviceKind {
+    Phone,
+    /// Also any value this server does not know.
+    #[default]
+    #[serde(other)]
+    Computer,
+}
+
+impl DeviceKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Computer => "computer",
+            Self::Phone => "phone",
+        }
+    }
+
+    pub fn parse(value: &str) -> Self {
+        match value {
+            "phone" => Self::Phone,
+            _ => Self::Computer,
+        }
+    }
+
+    pub fn is_computer(&self) -> bool {
+        *self == Self::Computer
+    }
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct StartRequest {
     pub host: HostInfo,
     pub host_key: String,
+    #[serde(skip_serializing_if = "DeviceKind::is_computer")]
+    pub kind: DeviceKind,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -281,6 +316,20 @@ mod tests {
             round_trip::<Control>(name);
         }
         round_trip::<Computers>("list_account_hosts.json");
+    }
+
+    #[test]
+    fn device_kind_defaults_to_computer() {
+        let runner: StartRequest = serde_json::from_str(r#"{"hostKey":"k"}"#).unwrap();
+        assert_eq!(runner.kind, DeviceKind::Computer);
+        let phone: StartRequest = serde_json::from_str(r#"{"kind":"phone"}"#).unwrap();
+        assert_eq!(phone.kind, DeviceKind::Phone);
+        let unknown: StartRequest = serde_json::from_str(r#"{"kind":"toaster"}"#).unwrap();
+        assert_eq!(unknown.kind, DeviceKind::Computer);
+        assert_eq!(
+            DeviceKind::parse(DeviceKind::Phone.as_str()),
+            DeviceKind::Phone
+        );
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use crate::protocol::{
-    self, Account, Computer, EnrollmentState, HostInfo, PollRequest, PollResponse, Secret,
-    StartRequest, StartResponse,
+    self, Account, Computer, DeviceKind, EnrollmentState, HostInfo, PollRequest, PollResponse,
+    Secret, StartRequest, StartResponse,
 };
 use crate::{AppState, auth, db, now, relay};
 use axum::{
@@ -117,6 +117,7 @@ async fn start(State(state): State<AppState>, body: Bytes) -> RpcResult<StartRes
     }
     let info = sanitize(request.host);
     let host_key = request.host_key;
+    let kind = request.kind;
     let device_code = auth::random_token();
     let device_hash = auth::sha256_hex(&device_code);
     let now = now();
@@ -135,6 +136,7 @@ async fn start(State(state): State<AppState>, body: Bytes) -> RpcResult<StartRes
                     state: "pending".into(),
                     user_id: None,
                     expires_at: now + ENROLLMENT_TTL,
+                    kind,
                 };
                 if db::insert_enrollment(c, &enrollment, now)? {
                     return Ok(Some(enrollment.user_code));
@@ -217,7 +219,11 @@ async fn poll(State(state): State<AppState>, body: Bytes) -> RpcResult<PollRespo
                                 let credential = auth::credential();
                                 let key = decode_host_key(&e.host_key).unwrap_or_default();
                                 let name = if e.info.hostname.is_empty() {
-                                    "Unnamed computer".to_owned()
+                                    match e.kind {
+                                        DeviceKind::Computer => "Unnamed computer",
+                                        DeviceKind::Phone => "Unnamed phone",
+                                    }
+                                    .to_owned()
                                 } else {
                                     e.info.hostname.clone()
                                 };
@@ -233,6 +239,7 @@ async fn poll(State(state): State<AppState>, body: Bytes) -> RpcResult<PollRespo
                                         fingerprint: &protocol::fingerprint(&key),
                                         credential_hash: &auth::sha256_hex(&credential),
                                         claim_expires_at,
+                                        kind: e.kind,
                                     },
                                     now,
                                 )?;
@@ -337,6 +344,7 @@ async fn list_hosts(State(state): State<AppState>, headers: HeaderMap) -> RpcRes
     Ok(Json(Hosts {
         hosts: hosts
             .into_iter()
+            .filter(|h| h.kind == DeviceKind::Computer)
             .map(|h| {
                 let connected = state.hub.connected_at(h.id);
                 Computer {

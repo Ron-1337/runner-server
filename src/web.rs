@@ -3,7 +3,9 @@ use crate::{
     auth::{self, AdminUser, CurrentUser},
     db,
     html::{Notice, e, page, time},
-    now, relay, rpc,
+    now,
+    protocol::DeviceKind,
+    relay, rpc,
 };
 use axum::{
     Form, Router,
@@ -313,8 +315,16 @@ async fn hosts_page(
         .await?;
     let mut rows = String::new();
     for h in &hosts {
+        let phone = h.kind == DeviceKind::Phone;
         let online = state.hub.connected_at(h.id);
         let status = match online {
+            // A phone only opens client routes, so it is never "online" as a host.
+            _ if phone => format!(
+                r#"<span class="tag">手机</span><div class="muted">{}</div>"#,
+                h.last_seen_at
+                    .map(|t| format!("最后使用 {}", time(t)))
+                    .unwrap_or_default()
+            ),
             Some(t) => format!(
                 r#"<span class="dot on"></span>在线<div class="muted">自 {}</div>"#,
                 time(t.timestamp())
@@ -330,7 +340,8 @@ async fn hosts_page(
             r#"<tr><td><b>{name}</b><div class="muted">{platform} {arch} · {os} · Runner {version}</div></td>
 <td class="mono">{fp}</td><td>{status}</td><td>{created}</td>
 <td><form class="inline row" method="post" action="/hosts/{id}/rename"><input type="text" name="name" value="{name}" required maxlength="64" style="width:160px"><button>改名</button></form>
-<form class="inline" method="post" action="/hosts/{id}/remove" onsubmit="return confirm('确定移除这台电脑？它需要重新登录才能再使用远程访问。')"><button class="danger">移除</button></form></td></tr>"#,
+<form class="inline" method="post" action="/hosts/{id}/remove" onsubmit="return confirm('确定移除这{noun}？它需要重新登录才能再使用远程访问。')"><button class="danger">移除</button></form></td></tr>"#,
+            noun = if phone { "部手机" } else { "台电脑" },
             name = e(&h.name),
             platform = e(&h.info.platform),
             arch = e(&h.info.arch),
@@ -462,17 +473,21 @@ async fn add_page(
     let fingerprint = rpc::decode_host_key(&en.host_key)
         .map(|k| crate::protocol::fingerprint(&k))
         .unwrap_or_default();
+    let (noun, title, shown_on) = match en.kind {
+        DeviceKind::Computer => ("台电脑", "批准电脑", "电脑终端"),
+        DeviceKind::Phone => ("部手机", "批准手机", "手机 App"),
+    };
     Ok(page(
-        "批准电脑",
+        title,
         Some(&me.user),
         None,
         &format!(
-            r#"<div class="card"><h1>批准这台电脑？</h1>
+            r#"<div class="card"><h1>批准这{noun}？</h1>
 <p class="code mono">{code}</p>
-<table><tr><th>电脑名</th><td>{name}</td></tr><tr><th>系统</th><td>{platform} {arch} · {os}</td></tr>
-<tr><th>Runner 版本</th><td>{version}</td></tr><tr><th>指纹</th><td class="mono">{fp}</td></tr>
+<table><tr><th>设备名</th><td>{name}</td></tr><tr><th>系统</th><td>{platform} {arch} · {os}</td></tr>
+<tr><th>版本</th><td>{version}</td></tr><tr><th>指纹</th><td class="mono">{fp}</td></tr>
 <tr><th>有效期至</th><td>{expires}</td></tr></table>
-<p class="muted">请确认代码和指纹与电脑终端中显示的一致。批准后这台电脑会加入账号 <b>{account}</b>。</p>
+<p class="muted">请确认代码和指纹与{shown_on}中显示的一致。批准后这{noun}会加入账号 <b>{account}</b>。</p>
 <form method="post" action="/hosts/add" class="row"><input type="hidden" name="code" value="{code}">
 <button class="primary" name="decision" value="approve">批准</button><button name="decision" value="deny">拒绝</button></form></div>"#,
             code = e(&en.user_code),
@@ -518,7 +533,7 @@ async fn add_submit(
     let (title, message) = if approve {
         (
             "已批准",
-            "已批准。请回到电脑终端确认账号，完成后这台电脑会出现在“我的电脑”中。",
+            "已批准。请回到电脑终端或手机 App 确认账号，完成后它会出现在“我的电脑”中。",
         )
     } else {
         ("已拒绝", "已拒绝这次登录请求。")

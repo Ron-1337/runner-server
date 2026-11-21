@@ -52,6 +52,7 @@ form.inline{display:inline}table{width:100%;border-collapse:collapse}th,td{text-
 .notice{padding:10px 14px;border-radius:6px;margin-bottom:18px}.ok{background:#dafbe1;color:#116329}.err{background:#ffebe9;color:#a40e26}
 .muted{color:#656d76;font-size:13px}code,.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.code{font-size:26px;letter-spacing:3px}
 .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px}.on{background:#1a7f37}.off{background:#afb8c1}
+.tag{display:inline-block;padding:1px 8px;border-radius:10px;background:#ddf4ff;color:#0969da;font-size:13px}
 .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
 "#;
 

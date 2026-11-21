@@ -68,15 +68,21 @@ impl Server {
     }
 
     async fn enroll(&self, browser: &reqwest::Client, name: &str, key: u8) -> (String, String) {
+        let request = json!({
+            "host": {"hostname": name, "platform": "linux", "arch": "x86_64", "osVersion": "Test", "runnerVersion": "0.20.2"},
+            "hostKey": STANDARD.encode([key; 32]),
+        });
+        self.enroll_with(browser, request, key).await
+    }
+
+    async fn enroll_with(
+        &self,
+        browser: &reqwest::Client,
+        request: Value,
+        key: u8,
+    ) -> (String, String) {
         let start: StartResponse = self
-            .call(
-                "HostEnrollmentService/StartEnrollment",
-                None,
-                json!({
-                    "host": {"hostname": name, "platform": "linux", "arch": "x86_64", "osVersion": "Test", "runnerVersion": "0.20.2"},
-                    "hostKey": STANDARD.encode([key; 32]),
-                }),
-            )
+            .call("HostEnrollmentService/StartEnrollment", None, request)
             .await
             .json()
             .await
@@ -138,6 +144,26 @@ impl Server {
             "device codes are single use"
         );
         (issued.host_id.clone(), issued.credential.0.clone())
+    }
+
+    /// The ids `ListAccountHosts` returns to this credential.
+    async fn host_ids(&self, credential: &str) -> Vec<String> {
+        let hosts: Value = self
+            .call(
+                "HostClientService/ListAccountHosts",
+                Some(credential),
+                json!({}),
+            )
+            .await
+            .json()
+            .await
+            .unwrap();
+        hosts["hosts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["id"].as_str().unwrap().to_owned())
+            .collect()
     }
 
     async fn ws(
@@ -581,4 +607,107 @@ async fn disabling_a_user_disconnects_their_computers() {
         "/login",
         "disabled users lose their web sessions"
     );
+}
+
+#[tokio::test]
+async fn phones_connect_to_computers_but_are_not_listed_as_computers() {
+    let s = server().await;
+    let admin = browser();
+    s.form(
+        &admin,
+        "/setup",
+        &[
+            ("username", "alice"),
+            ("password", "correct-horse"),
+            ("confirm", "correct-horse"),
+        ],
+    )
+    .await;
+
+    let (pc_id, pc_cred) = s.enroll(&admin, "studio", 1).await;
+    let (mut host, _) = s.host(&pc_cred).await;
+    let phone_request = json!({
+        "host": {"hostname": "Alice's iPhone", "platform": "ios", "arch": "arm64", "osVersion": "26.1", "runnerVersion": "0.1.0"},
+        "hostKey": STANDARD.encode([3; 32]),
+        "kind": "phone",
+    });
+    let (phone_id, phone_cred) = s.enroll_with(&admin, phone_request, 3).await;
+
+    assert_eq!(
+        s.host_ids(&pc_cred).await,
+        vec![pc_id.clone()],
+        "computers do not see the phone"
+    );
+    assert_eq!(
+        s.host_ids(&phone_cred).await,
+        vec![pc_id.clone()],
+        "the phone sees only computers, not itself"
+    );
+
+    // A phone is active without ever connecting as a host, so it survives the purge
+    // after its claim expires (10 minutes; the web session lasts 30 days).
+    {
+        let db = db::Db::open(&s._dir.path().join("test.db")).unwrap();
+        db::purge(&db.lock(), chrono::Utc::now().timestamp() + 3600).unwrap();
+    }
+    assert_eq!(s.host_ids(&phone_cred).await, vec![pc_id.clone()]);
+
+    assert_eq!(
+        refused_status(s.ws("/relay/host", &phone_cred, remote::SUBPROTOCOL).await),
+        403,
+        "a phone cannot register as a host"
+    );
+    assert_eq!(
+        refused_status(
+            s.ws(
+                &format!("/relay/client?host={phone_id}"),
+                &pc_cred,
+                remote::CLIENT_SUBPROTOCOL
+            )
+            .await
+        ),
+        404,
+        "a phone is not a route target"
+    );
+
+    let mut client = s
+        .ws(
+            &format!("/relay/client?host={pc_id}"),
+            &phone_cred,
+            remote::CLIENT_SUBPROTOCOL,
+        )
+        .await
+        .unwrap();
+    let open = text(&mut host).await;
+    assert_eq!(open["type"], "channelOpen");
+    let ch = open["channel"].as_u64().unwrap() as u32;
+    client.send(Message::Binary(vec![7].into())).await.unwrap();
+    assert_eq!(binary(&mut host).await, remote::wrap(ch, &[7]));
+
+    let page = admin
+        .get(format!("{}/hosts", s.origin))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(page.contains("Alice&#39;s iPhone"), "{page}");
+    assert!(
+        page.contains("最后使用"),
+        "the phone shows when it was last used"
+    );
+
+    let removed = s
+        .form(&admin, &format!("/hosts/{phone_id}/remove"), &[])
+        .await;
+    assert_eq!(removed.url().path(), "/hosts");
+    let listed = s
+        .call(
+            "HostClientService/ListAccountHosts",
+            Some(&phone_cred),
+            json!({}),
+        )
+        .await;
+    assert_eq!(listed.status(), 401, "a removed phone is signed out");
 }

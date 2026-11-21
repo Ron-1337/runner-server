@@ -1,6 +1,6 @@
 use crate::{
     AppState, auth, db, now,
-    protocol::{self, Account, CLIENT_SUBPROTOCOL, Control, MAX_FRAME},
+    protocol::{self, Account, CLIENT_SUBPROTOCOL, Control, DeviceKind, MAX_FRAME},
 };
 use axum::{
     Router,
@@ -308,6 +308,9 @@ async fn host_upgrade(
         Ok(found) => found,
         Err(status) => return status.into_response(),
     };
+    if host.kind != DeviceKind::Computer {
+        return StatusCode::FORBIDDEN.into_response();
+    }
     ws.protocols([protocol::SUBPROTOCOL])
         .max_message_size(protocol::MAX_RELAY_SIZE)
         .max_frame_size(protocol::MAX_RELAY_SIZE)
@@ -433,7 +436,7 @@ async fn client_upgrade(
     if !offers(&headers, CLIENT_SUBPROTOCOL) {
         return refusal(StatusCode::BAD_REQUEST);
     }
-    let (_, user) = match authenticate(&state, &headers).await {
+    let (me, user) = match authenticate(&state, &headers).await {
         Ok(found) => found,
         Err(status) => return refusal(status),
     };
@@ -442,7 +445,7 @@ async fn client_upgrade(
     };
     let host = state.db.call(move |c| db::host_by_id(c, target)).await;
     match host {
-        Ok(Some(h)) if h.user_id == user.id && h.activated => {}
+        Ok(Some(h)) if h.user_id == user.id && h.activated && h.kind == DeviceKind::Computer => {}
         Ok(_) => return refusal(StatusCode::NOT_FOUND),
         Err(e) => {
             tracing::error!("host lookup failed: {e:#}");
@@ -453,6 +456,11 @@ async fn client_upgrade(
         Err(OpenError::Offline) => return refusal(StatusCode::SERVICE_UNAVAILABLE),
         Err(OpenError::Busy) => return refusal(StatusCode::TOO_MANY_REQUESTS),
         Ok(()) => {}
+    }
+    if me.kind == DeviceKind::Phone {
+        // A phone has no host connection to update its last-seen time.
+        let id = me.id;
+        let _ = state.db.call(move |c| db::touch_host(c, id, now())).await;
     }
     ws.protocols([CLIENT_SUBPROTOCOL])
         .max_message_size(MAX_FRAME)
