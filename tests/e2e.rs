@@ -145,7 +145,7 @@ impl Server {
         path: &str,
         credential: &str,
         protocol: &str,
-    ) -> Result<Ws, tungstenite::Error> {
+    ) -> Result<Ws, Box<tungstenite::Error>> {
         let url = format!("{}{path}", self.origin.replacen("http", "ws", 1));
         let mut request = url.into_client_request().unwrap();
         let headers = request.headers_mut();
@@ -157,7 +157,7 @@ impl Server {
             "Sec-WebSocket-Protocol",
             HeaderValue::from_str(protocol).unwrap(),
         );
-        let (socket, response) = connect_async(request).await?;
+        let (socket, response) = connect_async(request).await.map_err(Box::new)?;
         assert_eq!(response.headers()["Sec-WebSocket-Protocol"], protocol);
         Ok(socket)
     }
@@ -213,8 +213,8 @@ async fn close_code(socket: &mut Ws) -> u16 {
     }
 }
 
-fn refused_status(result: Result<Ws, tungstenite::Error>) -> u16 {
-    match result {
+fn refused_status(result: Result<Ws, Box<tungstenite::Error>>) -> u16 {
+    match result.map_err(|e| *e) {
         Err(tungstenite::Error::Http(response)) => response.status().as_u16(),
         Err(e) => panic!("unexpected error {e}"),
         Ok(_) => panic!("connection unexpectedly accepted"),
