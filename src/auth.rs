@@ -199,7 +199,13 @@ pub fn clear_cookie(secure: bool) -> String {
 pub fn bearer(headers: &HeaderMap) -> Option<String> {
     let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
     let token = value.strip_prefix("Bearer ")?.trim();
-    crate::protocol::valid_bearer(token).then(|| token.to_owned())
+    crate::protocol::credential_kind(token).map(|_| token.to_owned())
+}
+
+/// Whether [token] is the kind of credential a device of [kind] holds: a
+/// computer's `rhc_`, a phone's `rcc_`.
+pub fn credential_fits(token: &str, kind: crate::protocol::DeviceKind) -> bool {
+    crate::protocol::credential_kind(token) == Some(kind)
 }
 
 /// The address a request came from, for display only. Forwarding headers count

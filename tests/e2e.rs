@@ -34,6 +34,14 @@ async fn server() -> Server {
     }
 }
 
+/// A phone's StartEnrollment, as the official Runner app sends it.
+fn phone_request(name: &str) -> Value {
+    json!({
+        "kind": "ENROLLMENT_KIND_CLIENT",
+        "client": {"platform": "ios", "runnerVersion": "0.1.0", "osVersion": "26.1", "name": name},
+    })
+}
+
 fn browser() -> reqwest::Client {
     reqwest::Client::builder()
         .cookie_store(true)
@@ -90,6 +98,7 @@ impl Server {
         request: Value,
         key: &[u8],
     ) -> (String, String) {
+        let phone = request["kind"] == "ENROLLMENT_KIND_CLIENT";
         let start: StartResponse = self
             .call("HostEnrollmentService/StartEnrollment", None, request)
             .await
@@ -125,10 +134,14 @@ impl Server {
             .text()
             .await
             .unwrap();
-        assert!(
-            page.contains(&remote::fingerprint(key)),
-            "approval page shows the fingerprint"
-        );
+        if phone {
+            assert!(!page.contains("指纹"), "a phone has no fingerprint");
+        } else {
+            assert!(
+                page.contains(&remote::fingerprint(key)),
+                "approval page shows the fingerprint"
+            );
+        }
         let approved = self
             .form(
                 browser,
@@ -140,12 +153,22 @@ impl Server {
 
         let issued = poll(start.device_code.0.clone()).await;
         assert_eq!(issued.state, EnrollmentState::Approved);
-        assert!(remote::valid_bearer(&issued.credential.0));
-        // Computers get /relay/host, which Runner checks; phones /relay/client.
-        assert!(remote::valid_relay_url(
-            &self.origin,
-            &issued.relay_url.replace("/relay/client", "/relay/host")
-        ));
+        let kind = remote::credential_kind(&issued.credential.0);
+        if phone {
+            // As the official service answers a client, plus this service's version.
+            assert_eq!(kind, Some(remote::DeviceKind::Phone));
+            assert_eq!(
+                issued.relay_url,
+                format!("{}/relay/client", self.origin.replacen("http", "ws", 1))
+            );
+            assert!(issued.host_id.is_empty(), "a phone gets a clientId");
+            assert!(!issued.client_id.is_empty());
+            assert_eq!(issued.server_version, env!("CARGO_PKG_VERSION"));
+        } else {
+            assert_eq!(kind, Some(remote::DeviceKind::Computer));
+            assert!(remote::valid_relay_url(&self.origin, &issued.relay_url));
+            assert!(issued.client_id.is_empty() && issued.server_version.is_empty());
+        }
         assert!(issued.account.is_some());
         assert!(
             chrono::DateTime::parse_from_rfc3339(issued.claim_expires_at.as_deref().unwrap())
@@ -156,7 +179,17 @@ impl Server {
             EnrollmentState::Expired,
             "device codes are single use"
         );
-        (issued.host_id.clone(), issued.credential.0.clone())
+        let id = if phone {
+            issued.client_id
+        } else {
+            issued.host_id
+        };
+        (id, issued.credential.0)
+    }
+
+    /// Signs in a phone named [name] as the official app does.
+    async fn enroll_phone(&self, browser: &reqwest::Client, name: &str) -> (String, String) {
+        self.enroll_with(browser, phone_request(name), 0).await
     }
 
     /// A web API call from [client]'s browser session: status and JSON body.
@@ -668,12 +701,7 @@ async fn phones_connect_to_computers_but_are_not_listed_as_computers() {
 
     let (pc_id, pc_cred) = s.enroll(&admin, "studio", 1).await;
     let (mut host, _) = s.host(&pc_cred).await;
-    let phone_request = json!({
-        "host": {"hostname": "Alice's iPhone", "platform": "ios", "arch": "arm64", "osVersion": "26.1", "runnerVersion": "0.1.0"},
-        "hostKey": STANDARD.encode([3; 32]),
-        "kind": "phone",
-    });
-    let (phone_id, phone_cred) = s.enroll_with(&admin, phone_request, 3).await;
+    let (phone_id, phone_cred) = s.enroll_phone(&admin, "Alice's iPhone").await;
 
     assert_eq!(
         s.host_ids(&pc_cred).await,
@@ -790,12 +818,7 @@ async fn hosts_notify_the_phone_that_opened_a_channel_through_bark() {
     .await;
     let (pc_id, pc_cred) = s.enroll(&admin, "studio", 1).await;
     let (mut host, _) = s.host(&pc_cred).await;
-    let phone_request = json!({
-        "host": {"hostname": "iPhone", "platform": "ios"},
-        "hostKey": STANDARD.encode([3; 32]),
-        "kind": "phone",
-    });
-    let (phone_id, phone_cred) = s.enroll_with(&admin, phone_request, 3).await;
+    let (phone_id, phone_cred) = s.enroll_phone(&admin, "iPhone").await;
 
     // The phone's channel is set from the app; the web page only shows it.
     let (bark, mut pushes) = fake_bark().await;
@@ -877,11 +900,22 @@ async fn hosts_notify_the_phone_that_opened_a_channel_through_bark() {
     assert_eq!(test["title"], "Runner Remote");
     assert_eq!(test["icon"], format!("{}/icon.png", s.origin));
 
-    // Every page shows the version; the icon and the web link into the app are public.
+    // No page carries the version: a signed-in page fills it in from GetMe,
+    // a signed-out one forgets it. The icon and the web link into the app are public.
+    let version = env!("CARGO_PKG_VERSION");
+    assert!(!page.contains(version), "{page}");
+    assert!(page.contains("AccountService/GetMe"), "{page}");
+    let login = reqwest::get(format!("{}/login", s.origin))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
     assert!(
-        page.contains(&format!("v{}", env!("CARGO_PKG_VERSION"))),
-        "{page}"
+        !login.contains(version) && !login.contains("GetMe"),
+        "{login}"
     );
+    assert!(login.contains("localStorage.removeItem"), "{login}");
     let icon = reqwest::get(format!("{}/icon.png", s.origin))
         .await
         .unwrap();
@@ -1135,9 +1169,8 @@ async fn the_service_watches_sessions_and_notifies_the_phone_that_took_them_over
     let (request_tx, mut requests) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(fake_runner::run(host, key, push_rx, request_tx));
 
-    let phone = |name: &str, key: u8| json!({"host": {"hostname": name, "platform": "ios"}, "hostKey": STANDARD.encode([key; 32]), "kind": "phone"});
-    let (_, first) = s.enroll_with(&admin, phone("First", 3), 3).await;
-    let (_, second) = s.enroll_with(&admin, phone("Second", 4), 4).await;
+    let (_, first) = s.enroll_phone(&admin, "First").await;
+    let (_, second) = s.enroll_phone(&admin, "Second").await;
     let (hook, mut hooks) = fake_hook().await;
     for (cred, topic) in [(&first, "first"), (&second, "second")] {
         let saved = s
@@ -1394,7 +1427,6 @@ async fn phones_enroll_in_the_official_format_and_sign_out_as_clients() {
     let (pc_id, pc_cred) = s.enroll(&admin, "studio", 1).await;
     let (_host, _) = s.host(&pc_cred).await;
     let request = json!({
-        "hostKey": STANDARD.encode([4; 32]),
         "kind": "ENROLLMENT_KIND_CLIENT",
         "client": {"name": "Alice's iPhone", "platform": "ios", "osVersion": "26.1", "runnerVersion": "1.2.0"},
     });
@@ -1410,6 +1442,14 @@ async fn phones_enroll_in_the_official_format_and_sign_out_as_clients() {
         403
     );
 
+    let wrong = s
+        .call(
+            "HostEnrollmentService/SignOutHost",
+            Some(&phone_cred),
+            json!({}),
+        )
+        .await;
+    assert_eq!(wrong.status(), 401, "SignOutHost is a computer's");
     let denied = s
         .call(
             "HostEnrollmentService/SignOutClient",
@@ -1453,6 +1493,7 @@ async fn the_web_api_signs_in_and_manages_devices() {
         (status, body["code"].as_str()),
         (401, Some("unauthenticated"))
     );
+    assert!(body.get("serverVersion").is_none());
     let (status, body) = s
         .web(
             &b,
@@ -1476,9 +1517,12 @@ async fn the_web_api_signs_in_and_manages_devices() {
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["user"]["username"], "alice");
     assert_eq!(body["user"]["isAdmin"], true);
+    let version = env!("CARGO_PKG_VERSION");
+    assert_eq!(body["serverVersion"], version, "told once signed in");
     let (status, me) = s.web(&b, "AccountService/GetMe", json!({})).await;
     assert_eq!(status, 200);
     assert_eq!(me["user"]["id"], body["user"]["id"]);
+    assert_eq!(me["serverVersion"], version);
 
     for method in ["AuthService/GetCaptcha", "AuthService/Register"] {
         assert_eq!(s.web(&b, method, json!({})).await.0, 501, "{method}");
@@ -1514,7 +1558,6 @@ async fn the_web_api_signs_in_and_manages_devices() {
         ))
         .header("X-Forwarded-For", "198.51.100.1, 203.0.113.9")
         .json(&json!({
-            "hostKey": STANDARD.encode([5; 32]),
             "kind": "ENROLLMENT_KIND_CLIENT",
             "client": {"name": "iPhone 17", "platform": "ios", "osVersion": "26.1", "runnerVersion": "1.2.0"},
         }))
@@ -1538,7 +1581,10 @@ async fn the_web_api_signs_in_and_manages_devices() {
     assert_eq!(e["client"]["name"], "iPhone 17");
     assert_eq!(e["client"]["osVersion"], "26.1");
     assert_eq!(e["requestingIp"], "203.0.113.9");
-    assert_eq!(e["fingerprint"], remote::fingerprint(&[5; 32]));
+    assert!(
+        e["fingerprint"].as_str().unwrap_or_default().is_empty(),
+        "a phone has no key"
+    );
     assert_eq!(
         s.web(
             &b,
@@ -1568,8 +1614,8 @@ async fn the_web_api_signs_in_and_manages_devices() {
         .await
         .unwrap();
     assert_eq!(poll.state, EnrollmentState::Approved);
-    assert_eq!(poll.client_id, poll.host_id, "phones get a clientId");
-    let (phone_id, phone_cred) = (poll.host_id, poll.credential.0);
+    assert!(poll.host_id.is_empty(), "phones get a clientId instead");
+    let (phone_id, phone_cred) = (poll.client_id, poll.credential.0);
 
     let (pc_id, pc_cred) = s.enroll(&b, "studio", 1).await;
     let (_, hosts) = s.web(&b, "HostService/ListHosts", json!({})).await;
@@ -1903,7 +1949,6 @@ async fn the_approval_page_returns_to_the_phone_app() {
             json!({
                 "kind": "ENROLLMENT_KIND_CLIENT",
                 "client": {"name": "Pixel"},
-                "hostKey": STANDARD.encode([7; 32]),
             }),
         )
         .await
@@ -1971,7 +2016,6 @@ async fn device_management_lists_phones_apart_and_takes_the_code_in_boxes() {
             json!({
                 "kind": "ENROLLMENT_KIND_CLIENT",
                 "client": {"name": "Pixel 9", "platform": "android"},
-                "hostKey": STANDARD.encode([8; 32]),
             }),
         )
         .await

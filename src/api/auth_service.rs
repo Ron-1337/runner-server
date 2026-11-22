@@ -28,8 +28,11 @@ struct SignInRequest {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct SignInResponse {
     user: User,
+    /// Told only once signed in, as GetMe does.
+    server_version: &'static str,
 }
 
 async fn sign_in(State(state): State<AppState>, body: Bytes) -> Result<Response, ApiError> {
@@ -81,6 +84,7 @@ async fn sign_in(State(state): State<AppState>, body: Bytes) -> Result<Response,
     with_cookie(
         SignInResponse {
             user: User::from(&user),
+            server_version: crate::html::VERSION,
         },
         &auth::session_cookie(&token, state.config.secure_cookies),
     )

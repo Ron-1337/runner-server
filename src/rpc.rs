@@ -123,15 +123,19 @@ async fn start(
     body: Bytes,
 ) -> RpcResult<StartResponse> {
     let request: StartRequest = parse(&body)?;
-    // The official phone app enrolls as a client without a key: its channels
-    // are keyed by pairing with each computer, not by the account.
-    let keyless_client = request.kind == DeviceKind::Phone && request.host_key.is_empty();
-    if !keyless_client && decode_host_key(&request.host_key).is_none() {
-        return Err(RpcError::invalid(
-            "hostKey must be a base64 32-byte public key.",
-        ));
-    }
-    let host_key = request.host_key.clone();
+    // A phone enrolls as a client without a key, as the official service
+    // takes it: its channels are keyed by pairing with each computer.
+    let host_key = match request.kind {
+        DeviceKind::Phone => String::new(),
+        DeviceKind::Computer if decode_host_key(&request.host_key).is_some() => {
+            request.host_key.clone()
+        }
+        DeviceKind::Computer => {
+            return Err(RpcError::invalid(
+                "hostKey must be a base64 32-byte public key.",
+            ));
+        }
+    };
     let kind = request.kind;
     let info = sanitize(request.device_info());
     let device_code = auth::random_token();
@@ -244,7 +248,10 @@ async fn poll(State(state): State<AppState>, body: Bytes) -> RpcResult<PollRespo
                                     DeviceKind::Phone => auth::client_credential(),
                                     DeviceKind::Computer => auth::credential(),
                                 };
-                                let key = decode_host_key(&e.host_key).unwrap_or_default();
+                                // A phone enrolls without a key, so it has no fingerprint.
+                                let fingerprint = decode_host_key(&e.host_key)
+                                    .map(|k| protocol::fingerprint(&k))
+                                    .unwrap_or_default();
                                 let name = if !e.name.is_empty() {
                                     e.name.clone()
                                 } else if e.info.hostname.is_empty() {
@@ -265,7 +272,7 @@ async fn poll(State(state): State<AppState>, body: Bytes) -> RpcResult<PollRespo
                                         name: &name,
                                         info: &e.info,
                                         host_key: &e.host_key,
-                                        fingerprint: &protocol::fingerprint(&key),
+                                        fingerprint: &fingerprint,
                                         credential_hash: &auth::sha256_hex(&credential),
                                         claim_expires_at,
                                         kind: e.kind,
@@ -310,7 +317,10 @@ async fn poll(State(state): State<AppState>, body: Bytes) -> RpcResult<PollRespo
             tracing::info!(host = host_id, user = %user.username, "host enrolled");
             PollResponse {
                 state: EnrollmentState::Approved,
-                host_id: host_id.to_string(),
+                host_id: match kind {
+                    DeviceKind::Computer => host_id.to_string(),
+                    DeviceKind::Phone => String::new(),
+                },
                 credential: Secret(credential),
                 relay_url: match kind {
                     DeviceKind::Phone => state.config.client_relay_url(),
@@ -323,6 +333,10 @@ async fn poll(State(state): State<AppState>, body: Bytes) -> RpcResult<PollRespo
                 claim_expires_at: rfc3339(claim_expires_at),
                 client_id: match kind {
                     DeviceKind::Phone => host_id.to_string(),
+                    DeviceKind::Computer => String::new(),
+                },
+                server_version: match kind {
+                    DeviceKind::Phone => crate::html::VERSION.to_owned(),
                     DeviceKind::Computer => String::new(),
                 },
             }
@@ -341,7 +355,11 @@ async fn authenticate(
         .call(move |c| db::host_by_credential(c, &hash))
         .await?
     {
-        Some((host, user)) if !user.disabled && host.usable(now()) => Ok((host, user)),
+        Some((host, user))
+            if !user.disabled && host.usable(now()) && auth::credential_fits(&token, host.kind) =>
+        {
+            Ok((host, user))
+        }
         _ => Err(RpcError::unauthenticated()),
     }
 }
@@ -349,8 +367,11 @@ async fn authenticate(
 #[derive(Serialize)]
 struct Empty {}
 
+/// A computer's sign-out; a phone signs out with `SignOutClient`.
 async fn sign_out(State(state): State<AppState>, headers: HeaderMap) -> RpcResult<Empty> {
-    let token = auth::bearer(&headers).ok_or_else(RpcError::unauthenticated)?;
+    let token = auth::bearer(&headers)
+        .filter(|t| auth::credential_fits(t, DeviceKind::Computer))
+        .ok_or_else(RpcError::unauthenticated)?;
     let hash = auth::sha256_hex(&token);
     let host = state
         .db

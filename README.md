@@ -107,9 +107,9 @@ location / {
 
 | 路径 | 说明 |
 | --- | --- |
-| `POST /api/runner_server.v1.HostEnrollmentService/StartEnrollment` | 开始登录，返回 device code 与 user code（10 分钟有效）。手机按官方格式发 `"kind": "ENROLLMENT_KIND_CLIENT"`（或 `2`）和 `client`（`name`、`platform`、`osVersion`、`runnerVersion`）；旧的 `"kind": "phone"` 加 `host` 仍然接受。手机批准后立即可用，不出现在 `ListAccountHosts` 中，不能连 `/relay/host`，也不能作为连接目标；Runner 不发送 `kind`，按电脑处理 |
-| `POST /api/runner_server.v1.HostEnrollmentService/PollEnrollment` | 轮询；批准后签发 `rhc_` 凭据（只返回一次），10 分钟内需连上中继。手机还会收到 `clientId`（与 `hostId` 相同） |
-| `POST /api/runner_server.v1.HostEnrollmentService/SignOutHost` | 电脑注销 |
+| `POST /api/runner_server.v1.HostEnrollmentService/StartEnrollment` | 开始登录，返回 device code 与 user code（10 分钟有效）。手机与官方一致：只发 `"kind": "ENROLLMENT_KIND_CLIENT"`（或 `2`）和 `client`（`name`、`platform`、`osVersion`、`runnerVersion`），不带 `hostKey`。手机批准后立即可用，不出现在 `ListAccountHosts` 中，不能连 `/relay/host`，也不能作为连接目标；Runner 不发送 `kind`，按电脑处理 |
+| `POST /api/runner_server.v1.HostEnrollmentService/PollEnrollment` | 轮询；批准后签发凭据（只返回一次）。电脑得到 `rhc_` 凭据、`hostId` 和 `/relay/host`，10 分钟内需连上中继；手机与官方一致，得到 `rcc_` 凭据、`clientId` 和 `/relay/client`（没有 `hostId`），另外多一个 `serverVersion`（本服务版本，官方没有，App 据此区分自建与官方服务器）。凭据只能用于对应的设备类型 |
+| `POST /api/runner_server.v1.HostEnrollmentService/SignOutHost` | 电脑注销，只接受电脑的凭据 |
 | `POST /api/runner_server.v1.HostEnrollmentService/SignOutClient` | 手机注销，只接受手机的凭据 |
 | `POST /api/runner_server.v1.HostClientService/ListAccountHosts` | 同账号电脑列表 |
 | `GET /relay/host`（`runner-relay.v1`） | 电脑常驻连接；`hello` → `welcome`，二进制帧带 4 字节大端通道号 |
@@ -117,12 +117,12 @@ location / {
 
 ### 网页端 API
 
-与官方 Runner Hub 相同的 Connect RPC（JSON），路径为 `POST /api/runner_server.v1.<服务>/<方法>`，`Content-Type: application/json`，用网页登录的 Cookie 认证；带 `Origin` 头时必须与 `--origin` 一致。出错时返回 Connect 错误 JSON，`details` 里带 `runner_server.v1.ErrorDetail`（官方的 `ErrorCode`）。现有的 HTML 页面照常可用。
+与官方 Runner Hub 相同的 Connect RPC（JSON），路径为 `POST /api/runner_server.v1.<服务>/<方法>`，`Content-Type: application/json`，用网页登录的 Cookie 认证；带 `Origin` 头时必须与 `--origin` 一致。出错时返回 Connect 错误 JSON，`details` 里带 `runner_server.v1.ErrorDetail`（官方的 `ErrorCode`）。现有的 HTML 页面照常可用。服务版本只在登录后告知：`SignIn` 和 `GetMe` 的响应带 `serverVersion`；网页里不含版本，登录后的页面从 `GetMe` 取得版本，缓存在浏览器里并显示在底栏，未登录的页面会清掉这个缓存。
 
 | 服务 | 方法 |
 | --- | --- |
 | `AuthService` | `SignIn`（`username`、`password`，不需要验证码）、`Refresh`、`SignOut`、`SignOutEverywhere` |
-| `AccountService` | `GetMe`、`ChangePassword` |
+| `AccountService` | `GetMe`（另带 `serverVersion`）、`ChangePassword` |
 | `HostService` | `ListHosts`、`ListClients`、`ListConnections`、`RenameHost`、`RemoveHost`、`RemoveClient`、`LookupEnrollment`、`ApproveEnrollment`（可带 `name` 给设备命名）、`DenyEnrollment` |
 | `AdminService`（管理员） | `ListUsers`、`DeactivateUser`、`ReactivateUser`、`ResetPassword`（返回临时密码），以及本服务的扩展 `CreateUser`（`username`、`displayName`、`password`、`isAdmin`）、`SetAdmin`（`userId`、`isAdmin`）、`DeleteUser`（`userId`） |
 

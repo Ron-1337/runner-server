@@ -13,13 +13,18 @@ pub fn routes() -> Router<AppState> {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct GetMeResponse {
     user: User,
+    /// This service's version, told only to a signed-in user; the pages
+    /// cache it for their footer.
+    server_version: &'static str,
 }
 
 async fn get_me(Session(me): Session) -> ApiResult<GetMeResponse> {
     Ok(Json(GetMeResponse {
         user: User::from(&me.user),
+        server_version: crate::html::VERSION,
     }))
 }
 

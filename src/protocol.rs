@@ -48,9 +48,9 @@ pub struct Account {
 /// computer to connect to.
 ///
 /// On the wire this is the official service's `EnrollmentKind`
-/// (`ENROLLMENT_KIND_HOST` / `ENROLLMENT_KIND_CLIENT`, or their numbers 1 / 2);
-/// this service's earlier `"phone"` is still accepted. It serializes as
-/// `"phone"` / `"computer"`, which is what `channelOpen.device.kind` carries.
+/// (`ENROLLMENT_KIND_HOST` / `ENROLLMENT_KIND_CLIENT`, or their numbers 1 / 2).
+/// It serializes as `"phone"` / `"computer"`, which is what
+/// `channelOpen.device.kind` carries.
 #[derive(Clone, Copy, Debug, Default, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum DeviceKind {
@@ -63,9 +63,7 @@ pub enum DeviceKind {
 impl<'de> Deserialize<'de> for DeviceKind {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         Ok(match serde_json::Value::deserialize(d)? {
-            serde_json::Value::String(s) if s == "phone" || s == "ENROLLMENT_KIND_CLIENT" => {
-                Self::Phone
-            }
+            serde_json::Value::String(s) if s == "ENROLLMENT_KIND_CLIENT" => Self::Phone,
             serde_json::Value::Number(n) if n.as_u64() == Some(2) => Self::Phone,
             _ => Self::Computer,
         })
@@ -131,17 +129,18 @@ pub struct StartRequest {
     pub host_key: String,
     #[serde(skip_serializing_if = "DeviceKind::is_computer")]
     pub kind: DeviceKind,
-    /// Sent with `ENROLLMENT_KIND_CLIENT` instead of [StartRequest::host].
+    /// A phone's details, sent with `ENROLLMENT_KIND_CLIENT` instead of
+    /// [StartRequest::host] and [StartRequest::host_key].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client: Option<ClientInfo>,
 }
 
 impl StartRequest {
-    /// The device's info: a phone's [ClientInfo] when it sent one, else `host`.
+    /// The device's info: a phone's [ClientInfo], a computer's `host`.
     pub fn device_info(self) -> HostInfo {
-        match (self.kind, self.client) {
-            (DeviceKind::Phone, Some(client)) => client.into_host_info(),
-            _ => self.host,
+        match self.kind {
+            DeviceKind::Phone => self.client.unwrap_or_default().into_host_info(),
+            DeviceKind::Computer => self.host,
         }
     }
 }
@@ -177,9 +176,13 @@ pub struct PollResponse {
     pub account: Option<Account>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub claim_expires_at: Option<String>,
-    /// Set for a phone, as the official service does; the same id as `hostId`.
+    /// A phone's id, which the official service sends instead of `hostId`.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub client_id: String,
+    /// This service's version, sent to a phone with its credential; the
+    /// official service sends none, which is how the app tells them apart.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub server_version: String,
 }
 fn secret_empty(s: &Secret) -> bool {
     s.0.is_empty()
@@ -298,13 +301,16 @@ pub fn decode_key(encoded: &str) -> Option<Vec<u8>> {
     STANDARD.decode(encoded).ok().filter(|k| k.len() == 32)
 }
 
-/// A bearer credential: a computer's `rhc_` or a phone's `rcc_` (phones
-/// enrolled before 0.1.3 hold `rhc_` ones, which keep working).
-pub fn valid_bearer(value: &str) -> bool {
-    valid_credential(value)
-        || value
-            .strip_prefix("rcc_")
-            .is_some_and(|token| valid_credential(&format!("rhc_{token}")))
+/// The device a bearer credential belongs to: a computer's `rhc_` or a phone's
+/// `rcc_`, as the official service issues them. None for anything else.
+pub fn credential_kind(value: &str) -> Option<DeviceKind> {
+    if valid_credential(value) {
+        return Some(DeviceKind::Computer);
+    }
+    value
+        .strip_prefix("rcc_")
+        .is_some_and(|token| valid_credential(&format!("rhc_{token}")))
+        .then_some(DeviceKind::Phone)
 }
 
 /// Runner rejects an enrollment credential that is not `rhc_` and 43 URL-safe characters.
@@ -444,7 +450,7 @@ mod tests {
         let runner: StartRequest = serde_json::from_str(r#"{"hostKey":"k"}"#).unwrap();
         assert_eq!(runner.kind, DeviceKind::Computer);
         let phone: StartRequest = serde_json::from_str(r#"{"kind":"phone"}"#).unwrap();
-        assert_eq!(phone.kind, DeviceKind::Phone);
+        assert_eq!(phone.kind, DeviceKind::Computer, "only the official kinds");
         let unknown: StartRequest = serde_json::from_str(r#"{"kind":"toaster"}"#).unwrap();
         assert_eq!(unknown.kind, DeviceKind::Computer);
         for (json, kind) in [
@@ -460,7 +466,7 @@ mod tests {
             );
         }
         let official: StartRequest = serde_json::from_str(
-            r#"{"hostKey":"k","kind":"ENROLLMENT_KIND_CLIENT","client":{"name":"iPhone","platform":"ios","osVersion":"18.1","runnerVersion":"1.0"}}"#,
+            r#"{"kind":"ENROLLMENT_KIND_CLIENT","client":{"name":"iPhone","platform":"ios","osVersion":"18.1","runnerVersion":"1.0"},"host":{"hostname":"ignored"}}"#,
         )
         .unwrap();
         let info = official.device_info();
@@ -500,6 +506,17 @@ mod tests {
             "rhc_Zm9vYmFyYmF6cXV4cXV1eGNvcmdlZ3JhdWx0Z2FycGx"
         ));
         assert!(!valid_credential("rhc_short"));
+        let token = "Zm9vYmFyYmF6cXV4cXV1eGNvcmdlZ3JhdWx0Z2FycGx";
+        assert_eq!(
+            credential_kind(&format!("rhc_{token}")),
+            Some(DeviceKind::Computer)
+        );
+        assert_eq!(
+            credential_kind(&format!("rcc_{token}")),
+            Some(DeviceKind::Phone)
+        );
+        assert_eq!(credential_kind("rcc_short"), None);
+        assert_eq!(credential_kind(&format!("rxx_{token}")), None);
     }
 
     #[test]

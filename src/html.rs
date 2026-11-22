@@ -20,8 +20,31 @@ pub fn e(value: &str) -> String {
     out
 }
 
-/// This service's version, shown at the foot of every page.
+/// This service's version. It is never in a page: only a signed-in user is
+/// told it (GetMe, SignIn, a phone's approved enrollment), and [VERSION_SCRIPT]
+/// shows it in the footer from there.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Where the pages cache the version a signed-in response told them.
+const VERSION_CACHE: &str = "runner-server-version";
+
+/// Signed in: shows the cached version at once, then asks GetMe and caches
+/// what it says. Signed out: forgets it, so it is not shown before signing in.
+fn version_script(signed_in: bool) -> String {
+    if !signed_in {
+        return format!(
+            "<script>try{{localStorage.removeItem('{VERSION_CACHE}')}}catch(e){{}}</script>"
+        );
+    }
+    format!(
+        r#"<script>(function(){{var k='{VERSION_CACHE}',el=document.getElementById('server-version');
+function show(v){{if(v)el.textContent='v'+v}}
+try{{show(localStorage.getItem(k))}}catch(e){{}}
+fetch('/api/runner_server.v1.AccountService/GetMe',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:'{{}}',credentials:'same-origin'}})
+.then(function(r){{return r.ok?r.json():null}}).then(function(me){{var v=me&&me.serverVersion;if(!v)return;
+try{{localStorage.setItem(k,v)}}catch(e){{}}show(v)}}).catch(function(){{}})}})();</script>"#
+    )
+}
 
 pub enum Notice {
     Ok(String),
@@ -87,9 +110,9 @@ pub fn page(title: &str, user: Option<&User>, notice: Option<Notice>, body: &str
         r#"<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{title} · Runner Server</title><style>{STYLE}</style></head>
 <body><header><div class="in"><b>Runner Server</b>{nav}</div></header><main>{notice}{body}</main>
-<footer><div class="in"><span>Runner Server</span><span class="mono" id="server-version">v{version}</span></div></footer></body></html>"#,
+<footer><div class="in"><span>Runner Server</span><span class="mono" id="server-version"></span></div></footer>{script}</body></html>"#,
         title = e(title),
-        version = VERSION,
+        script = version_script(user.is_some()),
     ))
 }
 

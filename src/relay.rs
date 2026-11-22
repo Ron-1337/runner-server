@@ -393,7 +393,11 @@ async fn authenticate(
             StatusCode::SERVICE_UNAVAILABLE
         })?;
     match found {
-        Some((host, user)) if !user.disabled && host.usable(now()) => Ok((host, user)),
+        Some((host, user))
+            if !user.disabled && host.usable(now()) && auth::credential_fits(&token, host.kind) =>
+        {
+            Ok((host, user))
+        }
         _ => Err(StatusCode::UNAUTHORIZED),
     }
 }
