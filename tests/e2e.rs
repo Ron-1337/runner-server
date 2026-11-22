@@ -141,7 +141,11 @@ impl Server {
         let issued = poll(start.device_code.0.clone()).await;
         assert_eq!(issued.state, EnrollmentState::Approved);
         assert!(remote::valid_bearer(&issued.credential.0));
-        assert!(remote::valid_relay_url(&self.origin, &issued.relay_url));
+        // Computers get /relay/host, which Runner checks; phones /relay/client.
+        assert!(remote::valid_relay_url(
+            &self.origin,
+            &issued.relay_url.replace("/relay/client", "/relay/host")
+        ));
         assert!(issued.account.is_some());
         assert!(
             chrono::DateTime::parse_from_rfc3339(issued.claim_expires_at.as_deref().unwrap())
@@ -1309,6 +1313,7 @@ async fn the_official_phone_app_enrolls_without_a_key() {
         .await
         .unwrap();
     assert!(page.contains("批准这部手机"), "{page}");
+    assert!(!page.contains("指纹"), "a keyless phone has no fingerprint");
     assert_eq!(poll().await["state"], "ENROLLMENT_STATE_PENDING");
     s.form(
         &admin,
@@ -1320,6 +1325,10 @@ async fn the_official_phone_app_enrolls_without_a_key() {
     assert_eq!(issued["state"], "ENROLLMENT_STATE_APPROVED");
     let credential = issued["credential"].as_str().unwrap().to_owned();
     assert!(credential.starts_with("rcc_"), "{credential}");
+    assert_eq!(
+        issued["relayUrl"],
+        format!("{}/relay/client", s.origin.replacen("http", "ws", 1))
+    );
     assert!(!issued["clientId"].as_str().unwrap().is_empty());
     assert_eq!(s.host_ids(&credential).await, vec![pc_id.clone()]);
     let _route = s

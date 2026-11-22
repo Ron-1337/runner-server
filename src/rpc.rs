@@ -312,7 +312,10 @@ async fn poll(State(state): State<AppState>, body: Bytes) -> RpcResult<PollRespo
                 state: EnrollmentState::Approved,
                 host_id: host_id.to_string(),
                 credential: Secret(credential),
-                relay_url: state.config.relay_url(),
+                relay_url: match kind {
+                    DeviceKind::Phone => state.config.client_relay_url(),
+                    DeviceKind::Computer => state.config.relay_url(),
+                },
                 account: Some(Account {
                     username: user.username,
                     display_name: user.display_name,

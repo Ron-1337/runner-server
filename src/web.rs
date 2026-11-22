@@ -573,10 +573,10 @@ async fn add_page(
             r#"<div class="card"><h1>批准这{noun}？</h1>
 <p class="code mono">{code}</p>
 <table><tr><th>设备名</th><td>{name}</td></tr><tr><th>系统</th><td>{platform} {arch} · {os}</td></tr>
-<tr><th>版本</th><td>{version}</td></tr><tr><th>指纹</th><td class="mono">{fp}</td></tr>
+<tr><th>版本</th><td>{version}</td></tr>{fp}
 <tr><th>请求来源</th><td class="mono">{ip}</td></tr>
 <tr><th>有效期至</th><td>{expires}</td></tr></table>
-<p class="muted">请确认代码和指纹与{shown_on}中显示的一致。批准后这{noun}会加入账号 <b>{account}</b>。</p>
+<p class="muted">请确认{what}与{shown_on}中显示的一致。批准后这{noun}会加入账号 <b>{account}</b>。</p>
 <form method="post" action="/hosts/add"><input type="hidden" name="code" value="{code}">{app}
 <label>设备名称</label><input type="text" name="name" value="{name}" maxlength="64" autocomplete="off">
 <p class="row"><button class="primary" name="decision" value="approve">批准</button><button name="decision" value="deny">拒绝</button></p></form></div>"#,
@@ -586,7 +586,12 @@ async fn add_page(
             arch = e(&en.info.arch),
             os = e(&en.info.os_version),
             version = e(&en.info.runner_version),
-            fp = e(&fingerprint),
+            what = if fingerprint.is_empty() { "代码" } else { "代码和指纹" },
+            fp = if fingerprint.is_empty() {
+                String::new()
+            } else {
+                format!(r#"<tr><th>指纹</th><td class="mono">{}</td></tr>"#, e(&fingerprint))
+            },
             ip = e(&en.requesting_ip),
             expires = time(en.expires_at),
             account = e(&me.user.username),
@@ -634,9 +639,15 @@ async fn add_submit(
         },
     };
     let user_id = me.user.id;
-    let decided = state
+    let (decided, phone) = state
         .db
-        .call(move |c| db::decide_enrollment(c, &code, approve, user_id, name.as_deref(), now()))
+        .call(move |c| {
+            let phone =
+                db::enrollment_by_code(c, &code)?.is_some_and(|en| en.kind == DeviceKind::Phone);
+            let decided =
+                db::decide_enrollment(c, &code, approve, user_id, name.as_deref(), now())?;
+            Ok((decided, phone))
+        })
         .await?;
     if !decided {
         return Ok(code_form(
@@ -648,10 +659,20 @@ async fn add_submit(
         let result = if approve { "approved" } else { "denied" };
         return Ok(Redirect::to(&format!("{APP_CALLBACK}?result={result}")).into_response());
     }
-    let (title, message) = if approve {
+    let (title, message) = if approve && phone {
         (
             "已批准",
-            "已批准。请回到电脑终端或手机 App 确认账号，完成后它会出现在“设备管理”中。",
+            "已批准这部手机。回到 Runner Remote 就会完成登录，可以关闭这个页面了。",
+        )
+    } else if approve {
+        (
+            "已批准",
+            "已批准。请回到电脑终端确认账号，完成后它会出现在“设备管理”中。",
+        )
+    } else if phone {
+        (
+            "已拒绝",
+            "已拒绝这次登录请求。回到 Runner Remote 可以重新发起登录。",
         )
     } else {
         ("已拒绝", "已拒绝这次登录请求。")

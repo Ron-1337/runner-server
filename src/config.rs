@@ -18,4 +18,9 @@ impl Config {
     pub fn relay_url(&self) -> String {
         format!("{}/relay/host", self.origin.replacen("http", "ws", 1))
     }
+
+    /// Where phones connect, as the official service tells its clients.
+    pub fn client_relay_url(&self) -> String {
+        format!("{}/relay/client", self.origin.replacen("http", "ws", 1))
+    }
 }
