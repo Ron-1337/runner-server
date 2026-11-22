@@ -286,7 +286,7 @@ impl Message {
     }
 }
 
-/// The URL scheme of the Runner Remote app (`runner-app/lib/core/links.dart`).
+/// The URL scheme of the Runner Remote app (`runner-remote/lib/core/links.dart`).
 pub const APP_LINK_PREFIX: &str = "runner-remote://";
 
 /// The app link that opens [session] on [computer] under [username]'s account on
