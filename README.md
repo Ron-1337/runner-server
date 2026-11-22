@@ -117,7 +117,7 @@ location / {
 
 ### 网页端 API
 
-与官方 Runner Hub 相同的 Connect RPC（JSON），路径为 `POST /api/runner_server.v1.<服务>/<方法>`，`Content-Type: application/json`，用网页登录的 Cookie 认证；带 `Origin` 头时必须与 `--origin` 一致。出错时返回 Connect 错误 JSON，`details` 里带 `runner_server.v1.ErrorDetail`（官方的 `ErrorCode`）。现有的 HTML 页面照常可用。服务版本只在登录后告知：`SignIn` 和 `GetMe` 的响应带 `serverVersion`；网页里不含版本，登录后的页面从 `GetMe` 取得版本，缓存在浏览器里并显示在底栏，未登录的页面会清掉这个缓存。
+与官方 Runner Hub 相同的 Connect RPC（JSON），路径为 `POST /api/runner_server.v1.<服务>/<方法>`，`Content-Type: application/json`，用网页登录的 Cookie 认证；带 `Origin` 头时必须与 `--origin` 一致。出错时返回 Connect 错误 JSON，`details` 里带 `runner_server.v1.ErrorDetail`（官方的 `ErrorCode`）。现有的 HTML 页面照常可用。服务版本的格式是 `vX.Y.Z(B)-commit`：`B` 是 GitHub Actions 的构建次数（本地构建为 0），`commit` 是构建所用提交的前 6 位。服务版本只在登录后告知：`SignIn` 和 `GetMe` 的响应带 `serverVersion`；网页里不含版本，登录后的页面从 `GetMe` 取得版本，缓存在浏览器里并显示在底栏，未登录的页面会清掉这个缓存。
 
 | 服务 | 方法 |
 | --- | --- |

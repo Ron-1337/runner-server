@@ -163,7 +163,7 @@ impl Server {
             );
             assert!(issued.host_id.is_empty(), "a phone gets a clientId");
             assert!(!issued.client_id.is_empty());
-            assert_eq!(issued.server_version, env!("CARGO_PKG_VERSION"));
+            assert_eq!(issued.server_version, runner_server::html::VERSION);
         } else {
             assert_eq!(kind, Some(remote::DeviceKind::Computer));
             assert!(remote::valid_relay_url(&self.origin, &issued.relay_url));
@@ -902,7 +902,7 @@ async fn hosts_notify_the_phone_that_opened_a_channel_through_bark() {
 
     // No page carries the version: a signed-in page fills it in from GetMe,
     // a signed-out one forgets it. The icon and the web link into the app are public.
-    let version = env!("CARGO_PKG_VERSION");
+    let version = runner_server::html::VERSION;
     assert!(!page.contains(version), "{page}");
     assert!(page.contains("AccountService/GetMe"), "{page}");
     let login = reqwest::get(format!("{}/login", s.origin))
@@ -1517,7 +1517,7 @@ async fn the_web_api_signs_in_and_manages_devices() {
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["user"]["username"], "alice");
     assert_eq!(body["user"]["isAdmin"], true);
-    let version = env!("CARGO_PKG_VERSION");
+    let version = runner_server::html::VERSION;
     assert_eq!(body["serverVersion"], version, "told once signed in");
     let (status, me) = s.web(&b, "AccountService/GetMe", json!({})).await;
     assert_eq!(status, 200);

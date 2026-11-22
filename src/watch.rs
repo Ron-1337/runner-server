@@ -219,7 +219,7 @@ impl Link<'_> {
             "type": "hello",
             "versions": [1],
             "client": "runner-server",
-            "build": env!("CARGO_PKG_VERSION"),
+            "build": crate::html::VERSION,
         });
         records
             .queue(serde_json::to_vec(&hello).expect("hello encodes"))

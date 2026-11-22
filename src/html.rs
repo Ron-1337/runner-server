@@ -20,10 +20,10 @@ pub fn e(value: &str) -> String {
     out
 }
 
-/// This service's version. It is never in a page: only a signed-in user is
-/// told it (GetMe, SignIn, a phone's approved enrollment), and [VERSION_SCRIPT]
-/// shows it in the footer from there.
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// This service's version, `vX.Y.Z(B)-commit` (see `build.rs`). It is never in
+/// a page: only a signed-in user is told it (GetMe, SignIn, a phone's approved
+/// enrollment), and [version_script] shows it in the footer from there.
+pub const VERSION: &str = env!("RUNNER_SERVER_VERSION");
 
 /// Where the pages cache the version a signed-in response told them.
 const VERSION_CACHE: &str = "runner-server-version";
@@ -38,7 +38,7 @@ fn version_script(signed_in: bool) -> String {
     }
     format!(
         r#"<script>(function(){{var k='{VERSION_CACHE}',el=document.getElementById('server-version');
-function show(v){{if(v)el.textContent='v'+v}}
+function show(v){{if(v)el.textContent=v}}
 try{{show(localStorage.getItem(k))}}catch(e){{}}
 fetch('/api/runner_server.v1.AccountService/GetMe',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:'{{}}',credentials:'same-origin'}})
 .then(function(r){{return r.ok?r.json():null}}).then(function(me){{var v=me&&me.serverVersion;if(!v)return;
@@ -127,4 +127,23 @@ pub fn forbidden(user: &User) -> Response {
         ),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn the_version_names_the_build_and_commit() {
+        // vX.Y.Z(B)-commit, with a six-character commit.
+        let version = super::VERSION;
+        let rest = version
+            .strip_prefix(&format!("v{}(", env!("CARGO_PKG_VERSION")))
+            .unwrap_or_else(|| panic!("{version}"));
+        let (build, commit) = rest.split_once(")-").unwrap_or_else(|| panic!("{version}"));
+        assert!(
+            !build.is_empty() && build.bytes().all(|b| b.is_ascii_digit()),
+            "{version}"
+        );
+        assert_eq!(commit.len(), 6, "{version}");
+        assert!(commit.bytes().all(|b| b.is_ascii_hexdigit()), "{version}");
+    }
 }

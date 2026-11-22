@@ -12,6 +12,10 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # The version is vX.Y.Z(B)-commit: B is this workflow's run number, commit the
+  # first six characters of the commit built (a pull request's head, not its merge).
+  RUNNER_BUILD_NUMBER: ${{ github.run_number }}
+  RUNNER_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
 
 jobs:
   test:
