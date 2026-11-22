@@ -2,7 +2,7 @@ use crate::protocol::{
     self, Account, Computer, DeviceKind, EnrollmentState, HostInfo, PollRequest, PollResponse,
     Secret, StartRequest, StartResponse,
 };
-use crate::{AppState, auth, db, now, relay};
+use crate::{AppState, auth, db, notify, now, relay, watch};
 use axum::{
     Json, Router,
     body::Bytes,
@@ -12,7 +12,7 @@ use axum::{
     routing::post,
 };
 use chrono::{DateTime, SecondsFormat};
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 pub const ENROLLMENT_TTL: i64 = 600;
 pub const CLAIM_TTL: i64 = 600;
@@ -20,6 +20,7 @@ pub const POLL_INTERVAL: i32 = 5;
 const MAX_PENDING_ENROLLMENTS: i64 = 1000;
 const ENROLL: &str = "/api/runner_server.v1.HostEnrollmentService";
 const CLIENT: &str = "/api/runner_server.v1.HostClientService";
+const NOTIFY: &str = "/api/runner_server.v1.NotifyService";
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -28,6 +29,13 @@ pub fn routes() -> Router<AppState> {
         .route(&format!("{ENROLL}/SignOutHost"), post(sign_out))
         .route(&format!("{ENROLL}/SignOutClient"), post(sign_out_client))
         .route(&format!("{CLIENT}/ListAccountHosts"), post(list_hosts))
+        .route(&format!("{NOTIFY}/GetSettings"), post(get_settings))
+        .route(&format!("{NOTIFY}/SetSettings"), post(set_settings))
+        .route(&format!("{NOTIFY}/Test"), post(test_notify))
+        .route(&format!("{NOTIFY}/ListWatchers"), post(list_watchers))
+        .route(&format!("{NOTIFY}/PairWatcher"), post(pair_watcher))
+        .route(&format!("{NOTIFY}/UnpairWatcher"), post(unpair_watcher))
+        .route(&format!("{NOTIFY}/ClaimSession"), post(claim_session))
 }
 
 pub struct RpcError {
@@ -393,4 +401,199 @@ async fn list_hosts(State(state): State<AppState>, headers: HeaderMap) -> RpcRes
             })
             .collect(),
     }))
+}
+
+// --- NotifyService: a phone's notification settings and the session watchers.
+
+async fn phone(state: &AppState, headers: &HeaderMap) -> Result<(db::Host, db::User), RpcError> {
+    let (me, user) = authenticate(state, headers).await?;
+    if me.kind != DeviceKind::Phone {
+        return Err(RpcError::new(
+            StatusCode::FORBIDDEN,
+            "permission_denied",
+            "This credential is not a phone's.",
+        ));
+    }
+    Ok((me, user))
+}
+
+/// One of [user]'s computers by its id as text.
+async fn my_computer(state: &AppState, user: &db::User, id: &str) -> Result<db::Host, RpcError> {
+    let not_found = || RpcError::new(StatusCode::NOT_FOUND, "not_found", "找不到这台电脑");
+    let id: i64 = id.parse().map_err(|_| not_found())?;
+    let user_id = user.id;
+    state
+        .db
+        .call(move |c| db::host_by_id(c, id))
+        .await?
+        .filter(|h| h.user_id == user_id && h.kind == DeviceKind::Computer && h.activated)
+        .ok_or_else(not_found)
+}
+
+#[derive(Serialize, Deserialize)]
+struct Settings {
+    #[serde(default)]
+    channel: Option<notify::Channel>,
+    #[serde(default)]
+    events: notify::Events,
+}
+
+async fn get_settings(State(state): State<AppState>, headers: HeaderMap) -> RpcResult<Settings> {
+    let (me, _) = phone(&state, &headers).await?;
+    let id = me.id;
+    let (channel, events) = state.db.call(move |c| db::notify_settings(c, id)).await?;
+    Ok(Json(Settings { channel, events }))
+}
+
+async fn set_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> RpcResult<Settings> {
+    let (me, _) = phone(&state, &headers).await?;
+    let request: Settings = parse(&body)?;
+    let channel = request
+        .channel
+        .map(notify::Channel::validate)
+        .transpose()
+        .map_err(RpcError::invalid)?;
+    let (id, events) = (me.id, request.events);
+    let saved = channel.clone();
+    state
+        .db
+        .call(move |c| db::set_notify_settings(c, id, saved.as_ref(), &events, now()))
+        .await?;
+    tracing::info!(
+        host = id,
+        off = channel.is_none(),
+        "notification settings saved"
+    );
+    Ok(Json(Settings { channel, events }))
+}
+
+async fn test_notify(State(state): State<AppState>, headers: HeaderMap) -> RpcResult<Empty> {
+    let (me, user) = phone(&state, &headers).await?;
+    let id = me.id;
+    let Some(channel) = state.db.call(move |c| db::notify_channel(c, id)).await? else {
+        return Err(RpcError::invalid("先选择推送方式并保存"));
+    };
+    let message = notify::test_message(&state.config.origin, &user.username, &me.name);
+    state.notifier.send(&channel, &message).await.map_err(|e| {
+        RpcError::new(
+            StatusCode::BAD_GATEWAY,
+            "unavailable",
+            format!("发送失败：{e:#}"),
+        )
+    })?;
+    Ok(Json(Empty {}))
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WatcherInfo {
+    computer: String,
+    name: String,
+    online: bool,
+    paired: bool,
+    watching: bool,
+    error: Option<String>,
+}
+
+#[derive(Serialize)]
+struct Watchers {
+    watchers: Vec<WatcherInfo>,
+}
+
+async fn list_watchers(State(state): State<AppState>, headers: HeaderMap) -> RpcResult<Watchers> {
+    let (_, user) = phone(&state, &headers).await?;
+    let user_id = user.id;
+    let (hosts, paired) = state
+        .db
+        .call(move |c| Ok((db::hosts_for_user(c, user_id)?, db::watcher_ids(c)?)))
+        .await?;
+    Ok(Json(Watchers {
+        watchers: hosts
+            .into_iter()
+            .filter(|h| h.kind == DeviceKind::Computer)
+            .map(|h| {
+                let status = state.watchers.status(h.id).unwrap_or_default();
+                WatcherInfo {
+                    computer: h.id.to_string(),
+                    online: state.hub.connected_at(h.id).is_some(),
+                    paired: paired.contains(&h.id),
+                    watching: status.watching,
+                    error: status.error,
+                    name: h.name,
+                }
+            })
+            .collect(),
+    }))
+}
+
+#[derive(Deserialize)]
+struct PairRequest {
+    computer: String,
+    pin: String,
+}
+
+async fn pair_watcher(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> RpcResult<Empty> {
+    let (_, user) = phone(&state, &headers).await?;
+    let request: PairRequest = parse(&body)?;
+    let computer = my_computer(&state, &user, &request.computer).await?;
+    watch::pair(&state, user.id, computer.id, request.pin.trim())
+        .await
+        .map_err(|m| RpcError::new(StatusCode::BAD_REQUEST, "failed_precondition", m))?;
+    Ok(Json(Empty {}))
+}
+
+#[derive(Deserialize)]
+struct ComputerRequest {
+    computer: String,
+}
+
+async fn unpair_watcher(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> RpcResult<Empty> {
+    let (_, user) = phone(&state, &headers).await?;
+    let request: ComputerRequest = parse(&body)?;
+    let id = my_computer(&state, &user, &request.computer).await?.id;
+    state.watchers.stop(id);
+    state.db.call(move |c| db::delete_watcher(c, id)).await?;
+    tracing::info!(host = id, "watcher unpaired");
+    Ok(Json(Empty {}))
+}
+
+#[derive(Deserialize)]
+struct ClaimRequest {
+    computer: String,
+    session: String,
+}
+
+async fn claim_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> RpcResult<Empty> {
+    let (me, user) = phone(&state, &headers).await?;
+    let request: ClaimRequest = parse(&body)?;
+    let session = request.session.trim().to_owned();
+    if session.is_empty() || session.len() > 128 {
+        return Err(RpcError::invalid("session is required."));
+    }
+    let computer = my_computer(&state, &user, &request.computer).await?.id;
+    let device = me.id;
+    state
+        .db
+        .call(move |c| {
+            db::claim_session(c, computer, &session, device, now())?;
+            db::claim_session(c, computer, "", device, now())
+        })
+        .await?;
+    Ok(Json(Empty {}))
 }

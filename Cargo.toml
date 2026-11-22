@@ -1,6 +1,6 @@
 [package]
 name = "runner-server"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 publish = false
 license = "MIT"
@@ -16,6 +16,8 @@ clap = { version = "4", features = ["derive", "env"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots"] }
+# Runner's companion channel (CPace + Noise), for watching sessions.
+runner-core = { git = "https://github.com/Ron-1337/runner", rev = "12c867d2f170f7a86900a4632f57f6264934b069" }
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -326,6 +326,49 @@ impl Hub {
     }
 }
 
+/// A channel the service itself opens to a computer, as the session watcher.
+pub struct WatchLink {
+    host: i64,
+    link: ClientLink,
+}
+
+/// The device a watch channel is opened as. Not a numeric host id, so it is
+/// never listed as a connection nor closed when a device is removed.
+pub const WATCHER_DEVICE: &str = "runner-server-watcher";
+
+impl WatchLink {
+    /// The next frame from the computer, or None once the channel closed.
+    pub async fn recv(&mut self) -> Option<Bytes> {
+        match self.link.rx.recv().await {
+            Some(ClientOut::Binary(bytes, counter)) => {
+                counter.fetch_sub(bytes.len(), Ordering::AcqRel);
+                Some(bytes)
+            }
+            Some(ClientOut::Close(..)) | None => None,
+        }
+    }
+}
+
+impl Hub {
+    pub fn open_watch(&self, host: i64) -> Result<WatchLink, OpenError> {
+        let device = ChannelDevice {
+            id: WATCHER_DEVICE.into(),
+            kind: DeviceKind::Phone,
+        };
+        let link = self.open_channel(host, device)?;
+        Ok(WatchLink { host, link })
+    }
+
+    /// Sends a frame to the computer; false once the channel is gone.
+    pub fn watch_send(&self, watch: &WatchLink, bytes: &[u8]) -> bool {
+        self.to_host(watch.host, &watch.link, bytes)
+    }
+
+    pub fn watch_close(&self, watch: &WatchLink) {
+        self.client_gone(watch.host, &watch.link);
+    }
+}
+
 fn offers(headers: &HeaderMap, protocol: &str) -> bool {
     headers
         .get_all(header::SEC_WEBSOCKET_PROTOCOL)
@@ -506,10 +549,17 @@ fn spawn_notify(
         title,
         body,
         url: Some(url),
+        context: notify::Context {
+            event: "host".into(),
+            computer: host.id.to_string(),
+            computer_name: host.name.clone(),
+            session: session.clone().unwrap_or_default(),
+            session_title: String::new(),
+        },
     };
     let (state, host_id, user_id) = (state.clone(), host.id, user.id);
     tokio::spawn(async move {
-        match notify::deliver(&state, user_id, device, message).await {
+        match notify::deliver(&state, user_id, device, None, message).await {
             Ok(true) => tracing::info!(host = host_id, device, "notification sent"),
             Ok(false) => tracing::debug!(host = host_id, device, "no notification channel"),
             Err(e) => tracing::warn!(host = host_id, device, "notification failed: {e:#}"),
@@ -594,9 +644,17 @@ async fn client_upgrade(
         Ok(()) => {}
     }
     if me.kind == DeviceKind::Phone {
-        // A phone has no host connection to update its last-seen time.
+        // A phone has no host connection to update its last-seen time. It is
+        // also now the phone notified about this computer's sessions that no
+        // phone took over.
         let id = me.id;
-        let _ = state.db.call(move |c| db::touch_host(c, id, now())).await;
+        let _ = state
+            .db
+            .call(move |c| {
+                db::touch_host(c, id, now())?;
+                db::claim_session(c, target, "", id, now())
+            })
+            .await;
     }
     ws.protocols([CLIENT_SUBPROTOCOL])
         .max_message_size(MAX_FRAME)

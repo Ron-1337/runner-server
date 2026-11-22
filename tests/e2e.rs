@@ -81,6 +81,15 @@ impl Server {
         request: Value,
         key: u8,
     ) -> (String, String) {
+        self.enroll_key(browser, request, &[key; 32]).await
+    }
+
+    async fn enroll_key(
+        &self,
+        browser: &reqwest::Client,
+        request: Value,
+        key: &[u8],
+    ) -> (String, String) {
         let start: StartResponse = self
             .call("HostEnrollmentService/StartEnrollment", None, request)
             .await
@@ -117,7 +126,7 @@ impl Server {
             .await
             .unwrap();
         assert!(
-            page.contains(&remote::fingerprint(&[key; 32])),
+            page.contains(&remote::fingerprint(key)),
             "approval page shows the fingerprint"
         );
         let approved = self
@@ -784,7 +793,7 @@ async fn hosts_notify_the_phone_that_opened_a_channel_through_bark() {
     });
     let (phone_id, phone_cred) = s.enroll_with(&admin, phone_request, 3).await;
 
-    // The phone's channel is configured on the web page; a computer has no such page.
+    // The phone's channel is set from the app; the web page only shows it.
     let (bark, mut pushes) = fake_bark().await;
     let hosts = admin
         .get(format!("{}/hosts", s.origin))
@@ -802,50 +811,66 @@ async fn hosts_notify_the_phone_that_opened_a_channel_through_bark() {
         .await
         .unwrap();
     assert_eq!(missing.status(), 404);
+
+    let settings = |channel: Value| json!({"channel": channel, "events": {"input": true, "finished": false, "failed": true}});
     let bad = s
-        .form(
-            &admin,
-            &format!("/hosts/{phone_id}/notify"),
-            &[
-                ("channel", "bark"),
-                ("server", &bark),
-                ("device_key", "no spaces"),
-            ],
+        .call(
+            "NotifyService/SetSettings",
+            Some(&phone_cred),
+            settings(json!({"kind": "bark", "server": bark, "deviceKey": "no spaces"})),
         )
+        .await;
+    assert_eq!(bad.status(), 400);
+    let bad: Value = bad.json().await.unwrap();
+    assert!(
+        bad["message"].as_str().unwrap().contains("Device Key 无效"),
+        "{bad}"
+    );
+    let refused = s
+        .call("NotifyService/GetSettings", Some(&pc_cred), json!({}))
+        .await;
+    assert_eq!(
+        refused.status(),
+        403,
+        "only phones have notification settings"
+    );
+    let saved = s
+        .call(
+            "NotifyService/SetSettings",
+            Some(&phone_cred),
+            settings(json!({"kind": "bark", "server": bark, "deviceKey": "phone-key", "group": "Runner", "level": "timeSensitive"})),
+        )
+        .await;
+    assert_eq!(saved.status(), 200);
+    let got: Value = s
+        .call("NotifyService/GetSettings", Some(&phone_cred), json!({}))
         .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(got["channel"]["deviceKey"], "phone-key");
+    assert_eq!(
+        got["events"],
+        json!({"input": true, "finished": false, "failed": true})
+    );
+    let page = admin
+        .get(format!("{}/hosts/{phone_id}/notify", s.origin))
+        .send()
+        .await
+        .unwrap()
         .text()
         .await
         .unwrap();
-    assert!(bad.contains("Device Key 无效"), "{bad}");
-    let saved = s
-        .form(
-            &admin,
-            &format!("/hosts/{phone_id}/notify"),
-            &[
-                ("channel", "bark"),
-                ("server", &bark),
-                ("device_key", "phone-key"),
-                ("group", "Runner"),
-                ("sound", ""),
-                ("level", "timeSensitive"),
-            ],
-        )
-        .await;
-    let saved_url = saved.url().clone();
-    assert_eq!(
-        saved_url.query(),
-        Some("ok=saved"),
-        "{}",
-        saved.text().await.unwrap()
-    );
+    assert!(page.contains("Bark"), "{page}");
 
     let tested = s
-        .form(&admin, &format!("/hosts/{phone_id}/notify/test"), &[])
+        .call("NotifyService/Test", Some(&phone_cred), json!({}))
         .await;
-    assert_eq!(tested.url().query(), Some("ok=sent"));
+    assert_eq!(tested.status(), 200);
     let test = timeout(WAIT, pushes.recv()).await.unwrap().unwrap();
     assert_eq!(test["device_key"], "phone-key");
     assert_eq!(test["level"], "timeSensitive");
+    assert_eq!(test["title"], "Runner Remote");
 
     // channelOpen names the device behind the channel.
     let _client = s
@@ -885,12 +910,14 @@ async fn hosts_notify_the_phone_that_opened_a_channel_through_bark() {
             .unwrap();
     }
     // Turning the channel off stops pushes too.
-    s.form(
-        &admin,
-        &format!("/hosts/{phone_id}/notify"),
-        &[("channel", "")],
-    )
-    .await;
+    let off = s
+        .call(
+            "NotifyService/SetSettings",
+            Some(&phone_cred),
+            json!({"channel": null}),
+        )
+        .await;
+    assert_eq!(off.status(), 200);
     let notify = json!({"type": "notify", "device": phone_id, "title": "x"});
     host.send(Message::Text(notify.to_string().into()))
         .await
@@ -901,6 +928,310 @@ async fn hosts_notify_the_phone_that_opened_a_channel_through_bark() {
             .is_err(),
         "no push for other devices or a phone without a channel"
     );
+}
+
+/// A stand-in ntfy or webhook server that records each request body.
+async fn fake_hook() -> (
+    String,
+    tokio::sync::mpsc::UnboundedReceiver<(String, String)>,
+) {
+    use axum::{Router, http::HeaderMap, routing::post};
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let handler = post(move |headers: HeaderMap, body: String| {
+        let tx = tx.clone();
+        async move {
+            let auth = headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_owned();
+            let _ = tx.send((auth, body));
+            "{}"
+        }
+    });
+    let router = Router::new()
+        .route("/", handler.clone())
+        .route("/{*path}", handler);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    (origin, rx)
+}
+
+mod fake_runner {
+    //! A minimal `runnerd` on the relay: pairs by PIN, accepts paired
+    //! devices, answers `hello` and `overview`, and pushes status changes.
+    use super::*;
+    use runner_core::companion::channel::{self, HostPair, Kind, NoiseKeys, Records, Reject};
+    use runner_core::remote::HostKey;
+    use std::collections::HashMap;
+
+    pub const PIN: &str = "482913";
+
+    #[allow(clippy::large_enum_variant)]
+    enum State {
+        Pairing(HostPair),
+        Open(Records),
+    }
+
+    /// Runs the host on [socket]; each value from [pushes] goes to every open channel.
+    pub async fn run(
+        mut socket: Ws,
+        key: HostKey,
+        mut pushes: tokio::sync::mpsc::UnboundedReceiver<Value>,
+        requests: tokio::sync::mpsc::UnboundedSender<Value>,
+    ) {
+        let mut channels: HashMap<u32, State> = HashMap::new();
+        let mut paired: Vec<Vec<u8>> = Vec::new();
+        let keys = || NoiseKeys {
+            private: &key.private,
+            fixed_ephemeral: None,
+        };
+        loop {
+            let mut out: Vec<(u32, Vec<u8>)> = Vec::new();
+            tokio::select! {
+                push = pushes.recv() => {
+                    let Some(push) = push else { return };
+                    for (ch, state) in channels.iter_mut() {
+                        if let State::Open(records) = state {
+                            records.queue(serde_json::to_vec(&push).unwrap()).unwrap();
+                            while let Some(f) = records.next_frame().unwrap() {
+                                out.push((*ch, f));
+                            }
+                        }
+                    }
+                }
+                message = socket.next() => {
+                    let Some(Ok(message)) = message else { return };
+                    let Message::Binary(bytes) = message else { continue };
+                    let (ch, frame) = channel::unwrap(&bytes).unwrap();
+                    match (frame[0], channels.remove(&ch)) {
+                        (k, None) if k == Kind::Pair as u8 => {
+                            let (pair, reply) =
+                                HostPair::start(keys(), PIN, frame, rand::random()).unwrap();
+                            out.push((ch, reply));
+                            channels.insert(ch, State::Pairing(pair));
+                        }
+                        (k, Some(State::Pairing(pair))) if k == Kind::PairFinish as u8 => {
+                            match pair.finish(frame) {
+                                Ok((transport, identity)) => {
+                                    assert_eq!(identity.name, "Runner Remote 通知服务");
+                                    paired.push(identity.public_key);
+                                    channels.insert(ch, State::Open(Records::new(transport)));
+                                }
+                                Err(reject) => out.push((ch, reject.frame())),
+                            }
+                        }
+                        (k, None) if k == Kind::Connect as u8 => {
+                            match channel::connect(keys(), frame, |d| paired.iter().any(|p| p == d)) {
+                                Ok((transport, accept, _)) => {
+                                    out.push((ch, accept));
+                                    channels.insert(ch, State::Open(Records::new(transport)));
+                                }
+                                Err(reject) => out.push((ch, reject.frame())),
+                            }
+                        }
+                        (_, Some(State::Open(mut records))) => {
+                            if let Some(request) = records.receive(frame).unwrap() {
+                                let request: Value = serde_json::from_slice(&request).unwrap();
+                                records.handled();
+                                let _ = requests.send(request.clone());
+                                for reply in answer(&request) {
+                                    records.queue(serde_json::to_vec(&reply).unwrap()).unwrap();
+                                }
+                            }
+                            while let Some(f) = records.next_frame().unwrap() {
+                                out.push((ch, f));
+                            }
+                            channels.insert(ch, State::Open(records));
+                        }
+                        (_, None) => {}
+                        _ => out.push((ch, Reject::BadHandshake.frame())),
+                    }
+                }
+            }
+            for (ch, frame) in out {
+                if socket
+                    .send(Message::Binary(channel::wrap(ch, &frame).into()))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        }
+    }
+
+    fn answer(request: &Value) -> Vec<Value> {
+        let id = &request["id"];
+        match request["type"].as_str().unwrap_or_default() {
+            "hello" => vec![
+                json!({"type": "welcome", "version": 1, "name": "studio", "runnerVersion": "0.20.2", "platform": "linux", "features": ["ping"]}),
+            ],
+            "ping" => vec![json!({"type": "pong", "id": id})],
+            "overview" => vec![json!({"type": "result", "id": id, "result": {
+                "projects": [], "tabs": [], "missions": [], "sessions": {
+                    "s1": {"kind": "chat", "title": "Fix the build", "runtime": "claude", "cwd": "/tmp", "status": "working", "reason": null, "unread": false},
+                    "s2": {"kind": "chat", "title": "Docs", "runtime": "claude", "cwd": "/tmp", "status": "working", "reason": null, "unread": false}
+                }
+            }})],
+            _ => {
+                vec![json!({"type": "error", "id": id, "code": "unknownRequest", "message": "no"})]
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_service_watches_sessions_and_notifies_the_phone_that_took_them_over() {
+    use runner_core::remote::HostKey;
+    let s = server().await;
+    let admin = browser();
+    s.setup(&admin).await;
+    let key = HostKey::generate().unwrap();
+    let request = json!({
+        "host": {"hostname": "studio", "platform": "linux"},
+        "hostKey": STANDARD.encode(&key.public),
+    });
+    let (pc_id, pc_cred) = s.enroll_key(&admin, request, &key.public).await;
+    let (host, _) = s.host(&pc_cred).await;
+    let (push_tx, push_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (request_tx, mut requests) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(fake_runner::run(host, key, push_rx, request_tx));
+
+    let phone = |name: &str, key: u8| json!({"host": {"hostname": name, "platform": "ios"}, "hostKey": STANDARD.encode([key; 32]), "kind": "phone"});
+    let (_, first) = s.enroll_with(&admin, phone("First", 3), 3).await;
+    let (_, second) = s.enroll_with(&admin, phone("Second", 4), 4).await;
+    let (hook, mut hooks) = fake_hook().await;
+    for (cred, topic) in [(&first, "first"), (&second, "second")] {
+        let saved = s
+            .call(
+                "NotifyService/SetSettings",
+                Some(cred),
+                json!({"channel": {"kind": "ntfy", "server": hook, "topic": topic, "token": "tk"}}),
+            )
+            .await;
+        assert_eq!(saved.status(), 200);
+    }
+
+    // Pairing needs the computer's PIN, and only reads.
+    let watchers: Value = s
+        .call("NotifyService/ListWatchers", Some(&first), json!({}))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(watchers["watchers"][0]["computer"], pc_id);
+    assert_eq!(watchers["watchers"][0]["paired"], false);
+    let wrong = s
+        .call(
+            "NotifyService/PairWatcher",
+            Some(&first),
+            json!({"computer": pc_id, "pin": "000000"}),
+        )
+        .await;
+    assert_eq!(wrong.status(), 400);
+    let paired = s
+        .call(
+            "NotifyService/PairWatcher",
+            Some(&first),
+            json!({"computer": pc_id, "pin": fake_runner::PIN}),
+        )
+        .await;
+    assert_eq!(paired.status(), 200, "{}", paired.text().await.unwrap());
+
+    // The watcher says hello and asks for the overview, nothing else.
+    let mut seen = Vec::new();
+    while seen.iter().filter(|t: &&String| *t == "overview").count() < 1 {
+        let request = timeout(WAIT, requests.recv()).await.unwrap().unwrap();
+        seen.push(request["type"].as_str().unwrap().to_owned());
+    }
+    assert!(
+        seen.iter()
+            .all(|t| ["hello", "overview", "ping"].contains(&t.as_str())),
+        "{seen:?}"
+    );
+    let listed: Value = s
+        .call("NotifyService/ListWatchers", Some(&first), json!({}))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(listed["watchers"][0]["paired"], true);
+    assert_eq!(listed["watchers"][0]["watching"], true);
+
+    // The first phone took s1 over…
+    let claimed = s
+        .call(
+            "NotifyService/ClaimSession",
+            Some(&first),
+            json!({"computer": pc_id, "session": "s1"}),
+        )
+        .await;
+    assert_eq!(claimed.status(), 200);
+    // …and the second phone connected after it, so it hears about the
+    // sessions nobody took over.
+    let _route = s
+        .ws(
+            &format!("/relay/client?host={pc_id}"),
+            &second,
+            remote::CLIENT_SUBPROTOCOL,
+        )
+        .await
+        .unwrap();
+
+    push_tx
+        .send(json!({"type": "status", "session": "s1", "status": "needsYou", "reason": "approval", "unread": false}))
+        .unwrap();
+    let (auth, body) = timeout(WAIT, hooks.recv()).await.unwrap().unwrap();
+    let body: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(auth, "Bearer tk");
+    assert_eq!(body["topic"], "first");
+    assert_eq!(body["title"], "Runner Remote");
+    assert_eq!(body["message"], "[需要输入]:Fix the build");
+    assert!(body["click"].as_str().unwrap().contains("session=s1"));
+
+    push_tx
+        .send(json!({"type": "status", "session": "s2", "status": "idle", "reason": null, "unread": true}))
+        .unwrap();
+    let (_, body) = timeout(WAIT, hooks.recv()).await.unwrap().unwrap();
+    let body: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(body["topic"], "second");
+    assert_eq!(body["message"], "[已完成]:Docs");
+
+    // A phone that turned "failed" off is not told.
+    let saved = s
+        .call(
+            "NotifyService/SetSettings",
+            Some(&first),
+            json!({"channel": {"kind": "webhook", "url": format!("{hook}/hook"), "template": "{\"text\":\"{{body}}\"}"}, "events": {"input": true, "finished": true, "failed": false}}),
+        )
+        .await;
+    assert_eq!(saved.status(), 200);
+    push_tx
+        .send(json!({"type": "status", "session": "s1", "status": "error", "reason": null, "unread": false}))
+        .unwrap();
+    push_tx
+        .send(json!({"type": "status", "session": "s1", "status": "needsYou", "reason": "answer", "unread": false}))
+        .unwrap();
+    let (_, body) = timeout(WAIT, hooks.recv()).await.unwrap().unwrap();
+    assert_eq!(body, r#"{"text":"[需要输入]:Fix the build"}"#);
+
+    let unpaired = s
+        .call(
+            "NotifyService/UnpairWatcher",
+            Some(&first),
+            json!({"computer": pc_id}),
+        )
+        .await;
+    assert_eq!(unpaired.status(), 200);
+    let listed: Value = s
+        .call("NotifyService/ListWatchers", Some(&first), json!({}))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(listed["watchers"][0]["paired"], false);
 }
 
 #[tokio::test]

@@ -1,5 +1,5 @@
 use crate::{
-    notify::Channel,
+    notify::{Channel, Events},
     protocol::{DeviceKind, HostInfo},
 };
 use anyhow::Result;
@@ -55,6 +55,19 @@ CREATE TABLE IF NOT EXISTS notify_channels (
     config TEXT NOT NULL,
     updated_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS watchers (
+    computer_id INTEGER PRIMARY KEY REFERENCES hosts(id) ON DELETE CASCADE,
+    client_private TEXT NOT NULL,
+    host_public TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS session_claims (
+    computer_id INTEGER NOT NULL REFERENCES hosts(id) ON DELETE CASCADE,
+    session TEXT NOT NULL,
+    device_id INTEGER NOT NULL REFERENCES hosts(id) ON DELETE CASCADE,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (computer_id, session)
+);
 "#;
 
 /// Columns added after the first release, as (table, column, definition).
@@ -64,6 +77,7 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("users", "last_login_at", "INTEGER"),
     ("enrollments", "requesting_ip", "TEXT NOT NULL DEFAULT ''"),
     ("enrollments", "name", "TEXT NOT NULL DEFAULT ''"),
+    ("notify_channels", "events", "TEXT NOT NULL DEFAULT '{}'"),
 ];
 
 fn migrate(c: &Connection) -> Result<()> {
@@ -545,37 +559,128 @@ pub fn touch_host(c: &Connection, id: i64, now: i64) -> Result<()> {
     Ok(())
 }
 
-/// How notifications reach the phone [host_id], if set on the web page.
-pub fn notify_channel(c: &Connection, host_id: i64) -> Result<Option<Channel>> {
-    let config: Option<String> = c
+/// How notifications reach the phone [host_id] and which session events it wants.
+pub fn notify_settings(c: &Connection, host_id: i64) -> Result<(Option<Channel>, Events)> {
+    let row: Option<(String, String)> = c
         .query_row(
-            "SELECT config FROM notify_channels WHERE host_id = ?1",
+            "SELECT config, events FROM notify_channels WHERE host_id = ?1",
             [host_id],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
+    let Some((config, events)) = row else {
+        return Ok((None, Events::default()));
+    };
     // A channel this version cannot read counts as none.
-    Ok(config.and_then(|c| serde_json::from_str(&c).ok()))
+    Ok((
+        serde_json::from_str(&config).ok(),
+        serde_json::from_str(&events).unwrap_or_default(),
+    ))
 }
 
-pub fn set_notify_channel(
+pub fn notify_channel(c: &Connection, host_id: i64) -> Result<Option<Channel>> {
+    Ok(notify_settings(c, host_id)?.0)
+}
+
+pub fn set_notify_settings(
     c: &Connection,
     host_id: i64,
     channel: Option<&Channel>,
+    events: &Events,
     now: i64,
 ) -> Result<()> {
-    match channel {
-        Some(channel) => c.execute(
-            "INSERT INTO notify_channels (host_id, config, updated_at) VALUES (?1, ?2, ?3)
-             ON CONFLICT(host_id) DO UPDATE SET config = excluded.config, updated_at = excluded.updated_at",
-            params![host_id, serde_json::to_string(channel)?, now],
-        )?,
-        None => c.execute("DELETE FROM notify_channels WHERE host_id = ?1", [host_id])?,
-    };
+    c.execute(
+        "INSERT INTO notify_channels (host_id, config, events, updated_at) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(host_id) DO UPDATE SET config = excluded.config, events = excluded.events,
+         updated_at = excluded.updated_at",
+        params![
+            host_id,
+            serde_json::to_string(&channel)?,
+            serde_json::to_string(events)?,
+            now
+        ],
+    )?;
     Ok(())
 }
 
+/// The keys the service paired with [computer] to watch its sessions.
+#[derive(Clone)]
+pub struct Watcher {
+    pub computer: i64,
+    pub client_private: String,
+    pub host_public: String,
+}
+
+pub fn watcher(c: &Connection, computer: i64) -> Result<Option<Watcher>> {
+    Ok(c.query_row(
+        "SELECT computer_id, client_private, host_public FROM watchers WHERE computer_id = ?1",
+        [computer],
+        |r| {
+            Ok(Watcher {
+                computer: r.get(0)?,
+                client_private: r.get(1)?,
+                host_public: r.get(2)?,
+            })
+        },
+    )
+    .optional()?)
+}
+
+pub fn watcher_ids(c: &Connection) -> Result<Vec<i64>> {
+    let mut stmt = c.prepare("SELECT computer_id FROM watchers")?;
+    let rows = stmt.query_map([], |r| r.get(0))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+pub fn set_watcher(c: &Connection, w: &Watcher, now: i64) -> Result<()> {
+    c.execute(
+        "INSERT INTO watchers (computer_id, client_private, host_public, created_at) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(computer_id) DO UPDATE SET client_private = excluded.client_private,
+         host_public = excluded.host_public, created_at = excluded.created_at",
+        params![w.computer, w.client_private, w.host_public, now],
+    )?;
+    Ok(())
+}
+
+pub fn delete_watcher(c: &Connection, computer: i64) -> Result<bool> {
+    Ok(c.execute("DELETE FROM watchers WHERE computer_id = ?1", [computer])? > 0)
+}
+
+/// Records that [device] took over [session] on [computer]; an empty session
+/// records the phone that last connected to the computer at all.
+pub fn claim_session(
+    c: &Connection,
+    computer: i64,
+    session: &str,
+    device: i64,
+    now: i64,
+) -> Result<()> {
+    c.execute(
+        "INSERT INTO session_claims (computer_id, session, device_id, updated_at) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(computer_id, session) DO UPDATE SET device_id = excluded.device_id,
+         updated_at = excluded.updated_at",
+        params![computer, session, device, now],
+    )?;
+    Ok(())
+}
+
+/// The phone to notify about [session]: the one that took it over, or else the
+/// one that last connected to [computer].
+pub fn session_owner(c: &Connection, computer: i64, session: &str) -> Result<Option<i64>> {
+    Ok(c.query_row(
+        "SELECT device_id FROM session_claims WHERE computer_id = ?1 AND session IN (?2, '')
+         ORDER BY session = '' LIMIT 1",
+        params![computer, session],
+        |r| r.get(0),
+    )
+    .optional()?)
+}
+
 pub fn purge(c: &Connection, now: i64) -> Result<()> {
+    c.execute(
+        "DELETE FROM session_claims WHERE session != '' AND updated_at <= ?1",
+        [now - 30 * 86400],
+    )?;
     c.execute("DELETE FROM web_sessions WHERE expires_at <= ?1", [now])?;
     c.execute("DELETE FROM enrollments WHERE expires_at <= ?1", [now])?;
     c.execute(

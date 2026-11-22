@@ -70,6 +70,7 @@ async fn main() -> anyhow::Result<()> {
     .with_graceful_shutdown(async move {
         shutdown_signal().await;
         tracing::info!("shutting down");
+        hub.watchers.shutdown();
         hub.hub.shutdown();
     })
     .await?;

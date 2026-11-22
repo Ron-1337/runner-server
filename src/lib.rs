@@ -7,6 +7,7 @@ pub mod notify;
 pub mod protocol;
 pub mod relay;
 pub mod rpc;
+pub mod watch;
 pub mod web;
 
 use axum::Router;
@@ -21,6 +22,7 @@ pub struct Inner {
     pub hub: relay::Hub,
     pub limiter: auth::LoginLimiter,
     pub notifier: notify::Notifier,
+    pub watchers: watch::Watchers,
 }
 
 impl Deref for AppState {
@@ -38,6 +40,7 @@ impl AppState {
             hub: relay::Hub::default(),
             limiter: auth::LoginLimiter::default(),
             notifier: notify::Notifier::default(),
+            watchers: watch::Watchers::default(),
         }))
     }
 }
@@ -55,7 +58,10 @@ pub fn now() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
+/// Starts the session watchers and the periodic cleanup.
 pub fn spawn_maintenance(state: AppState) {
+    let watchers = state.clone();
+    tokio::spawn(async move { watch::start_all(&watchers).await });
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(600));
         loop {

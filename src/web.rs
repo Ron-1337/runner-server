@@ -3,7 +3,7 @@ use crate::{
     auth::{self, AdminUser, CurrentUser},
     db,
     html::{Notice, e, page, time},
-    notify::{self, BARK_LEVELS, Bark, Channel},
+    notify::{self, Channel},
     now,
     protocol::DeviceKind,
     relay, rpc,
@@ -54,7 +54,7 @@ pub fn routes(state: AppState) -> Router<AppState> {
         .route("/hosts/add", get(add_page).post(add_submit))
         .route("/hosts/{id}/remove", post(remove_host))
         .route("/hosts/{id}/rename", post(rename_host))
-        .route("/hosts/{id}/notify", get(notify_page).post(notify_submit))
+        .route("/hosts/{id}/notify", get(notify_page))
         .route("/hosts/{id}/notify/test", post(notify_test))
         .route("/account", get(account_page).post(account_submit))
         .route("/admin/users", get(users_page).post(create_user))
@@ -892,71 +892,43 @@ fn not_found(user: &db::User) -> Response {
         .into_response()
 }
 
+fn channel_summary(channel: Option<&Channel>) -> String {
+    match channel {
+        None => "不推送".into(),
+        Some(Channel::Bark(b)) => format!("Bark · {}", e(&b.server)),
+        Some(Channel::Ntfy(n)) => format!("ntfy · {}/{}", e(&n.server), e(&n.topic)),
+        Some(Channel::Webhook(w)) => {
+            let host = url::Url::parse(&w.url)
+                .ok()
+                .and_then(|u| u.host_str().map(str::to_owned))
+                .unwrap_or_default();
+            format!("Webhook · {}", e(&host))
+        }
+    }
+}
+
+/// The phone's notification settings are made in the app; this page shows
+/// them and can send a test.
 fn notify_form(
     user: &db::User,
     phone: &db::Host,
     channel: Option<&Channel>,
     notice: Option<Notice>,
 ) -> Response {
-    let bark = match channel {
-        Some(Channel::Bark(b)) => b.clone(),
-        None => Bark::default(),
-    };
-    let enabled = channel.is_some();
-    let levels: String = BARK_LEVELS
-        .iter()
-        .map(|(value, label)| {
-            format!(
-                r#"<option value="{v}"{sel}>{l}</option>"#,
-                v = e(value),
-                l = e(label),
-                sel = if *value == bark.level {
-                    " selected"
-                } else {
-                    ""
-                }
-            )
-        })
-        .collect();
-    let server = if bark.server.is_empty() {
-        notify::DEFAULT_BARK_SERVER
-    } else {
-        &bark.server
-    };
-    let group = if enabled {
-        bark.group.as_str()
-    } else {
-        "Runner"
-    };
     page(
         "通知设置",
         Some(user),
         notice,
         &format!(
             r#"<div class="card"><h1>通知设置：{name}</h1>
-<p class="muted">电脑上的会话需要你处理时，通知只发给最后连接这个会话的设备。最后连接的是这部手机时，通过下面的通道推送；点开通知会在 Runner Remote 中打开这个会话。</p>
-<form method="post" action="/hosts/{id}/notify">
-<label>通道</label>
-<select name="channel"><option value="">不发送</option><option value="bark"{bark_selected}>Bark（iOS）</option></select>
-<label>Bark 服务器</label><input type="text" name="server" value="{server}" placeholder="{default}">
-<div class="muted">官方服务器 {default}，或自建的 bark-server 地址</div>
-<label>Device Key</label><input type="text" name="device_key" value="{key}" autocomplete="off" class="mono">
-<div class="muted">在 Bark App 首页复制推送地址，取 {default}/ 后面的那一段</div>
-<label>分组</label><input type="text" name="group" value="{group}" maxlength="64">
-<label>铃声</label><input type="text" name="sound" value="{sound}" maxlength="64" placeholder="留空用默认铃声，例如 minuet">
-<label>中断级别</label><select name="level">{levels}</select>
-<p><button class="primary">保存</button></p></form>
+<p class="muted">推送方式和通知类型在 Runner Remote App 的“设置 → 通知”里修改。服务器监听电脑上的会话，会话需要输入、完成或失败时，只通知最后接管这个会话的手机（没有人接管时，通知最后连接这台电脑的手机）。</p>
+<p>当前推送方式：<b>{summary}</b></p>
 <form method="post" action="/hosts/{id}/notify/test"><button{test_disabled}>发送测试通知</button></form>
 <p><a href="/hosts">返回设备管理</a></p></div>"#,
             name = e(&phone.name),
             id = phone.id,
-            bark_selected = if enabled { " selected" } else { "" },
-            server = e(server),
-            default = notify::DEFAULT_BARK_SERVER,
-            key = e(&bark.device_key),
-            group = e(group),
-            sound = e(&bark.sound),
-            test_disabled = if enabled { "" } else { " disabled" },
+            summary = channel_summary(channel),
+            test_disabled = if channel.is_some() { "" } else { " disabled" },
         ),
     )
     .into_response()
@@ -973,67 +945,10 @@ async fn notify_page(
     };
     let channel = state.db.call(move |c| db::notify_channel(c, id)).await?;
     let notice = match q.ok.as_deref() {
-        Some("saved") => Notice::ok("已保存。"),
-        Some("off") => Notice::ok("已关闭这部手机的通知。"),
         Some("sent") => Notice::ok("测试通知已发送，请查看手机。"),
         _ => None,
     };
     Ok(notify_form(&me.user, &phone, channel.as_ref(), notice))
-}
-
-#[derive(Default, Deserialize)]
-#[serde(default)]
-struct NotifyForm {
-    channel: String,
-    server: String,
-    device_key: String,
-    group: String,
-    sound: String,
-    level: String,
-}
-
-async fn notify_submit(
-    State(state): State<AppState>,
-    me: CurrentUser,
-    Path(id): Path<i64>,
-    Form(form): Form<NotifyForm>,
-) -> WebResult {
-    let Some(phone) = my_phone(&state, me.user.id, id).await? else {
-        return Ok(not_found(&me.user));
-    };
-    let bark = Bark {
-        server: form.server,
-        device_key: form.device_key,
-        group: form.group,
-        sound: form.sound,
-        level: form.level,
-    };
-    let channel = match form.channel.as_str() {
-        "" => None,
-        "bark" => match bark.clone().validate() {
-            Ok(bark) => Some(Channel::Bark(bark)),
-            Err(m) => {
-                let draft = Channel::Bark(bark);
-                return Ok(notify_form(&me.user, &phone, Some(&draft), Notice::err(m)));
-            }
-        },
-        _ => {
-            return Ok(notify_form(
-                &me.user,
-                &phone,
-                None,
-                Notice::err("未知的通道"),
-            ));
-        }
-    };
-    let off = channel.is_none();
-    state
-        .db
-        .call(move |c| db::set_notify_channel(c, id, channel.as_ref(), now()))
-        .await?;
-    tracing::info!(host = id, off, "notification channel saved");
-    let ok = if off { "off" } else { "saved" };
-    Ok(Redirect::to(&format!("/hosts/{id}/notify?ok={ok}")).into_response())
 }
 
 async fn notify_test(
@@ -1050,18 +965,10 @@ async fn notify_test(
             &me.user,
             &phone,
             None,
-            Notice::err("先选择通道并保存。"),
+            Notice::err("先在 Runner Remote App 的设置里选择推送方式。"),
         ));
     };
-    let message = notify::Message {
-        title: "Runner 测试通知".into(),
-        body: format!("{} 的通知设置正常。", phone.name),
-        url: Some(notify::app_link(
-            &state.config.origin,
-            &me.user.username,
-            None,
-        )),
-    };
+    let message = notify::test_message(&state.config.origin, &me.user.username, &phone.name);
     if let Err(err) = state.notifier.send(&channel, &message).await {
         return Ok(notify_form(
             &me.user,
