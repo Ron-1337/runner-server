@@ -20,6 +20,9 @@ pub fn e(value: &str) -> String {
     out
 }
 
+/// This service's version, shown at the foot of every page.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 pub enum Notice {
     Ok(String),
     Err(String),
@@ -54,6 +57,8 @@ form.inline{display:inline}table{width:100%;border-collapse:collapse}th,td{text-
 .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px}.on{background:#1a7f37}.off{background:#afb8c1}
 .tag{display:inline-block;padding:1px 8px;border-radius:10px;background:#ddf4ff;color:#0969da;font-size:13px}
 .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+body{min-height:100vh;display:flex;flex-direction:column}main{flex:1;width:100%}
+footer{border-top:1px solid #e3e6ea;background:#fff}footer .in{max-width:960px;margin:0 auto;padding:12px 20px;display:flex;gap:12px;justify-content:space-between;flex-wrap:wrap;color:#656d76;font-size:13px}
 .boxes{display:flex;gap:6px;align-items:center;flex-wrap:nowrap}.boxes .box{width:2.4em;height:2.8em;padding:0;text-align:center;font:600 20px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;text-transform:uppercase;border:1px solid #cfd4da;border-radius:6px}
 .boxes .box:focus{outline:2px solid #1f6feb;border-color:#1f6feb}.boxes .dash{font-size:22px;color:#656d76;padding:0 2px}
 @media(max-width:420px){.boxes{gap:4px}.boxes .box{width:2em;height:2.4em;font-size:17px}}
@@ -81,8 +86,10 @@ pub fn page(title: &str, user: Option<&User>, notice: Option<Notice>, body: &str
     Html(format!(
         r#"<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{title} · Runner Server</title><style>{STYLE}</style></head>
-<body><header><div class="in"><b>Runner Server</b>{nav}</div></header><main>{notice}{body}</main></body></html>"#,
+<body><header><div class="in"><b>Runner Server</b>{nav}</div></header><main>{notice}{body}</main>
+<footer><div class="in"><span>Runner Server</span><span class="mono" id="server-version">v{version}</span></div></footer></body></html>"#,
         title = e(title),
+        version = VERSION,
     ))
 }
 

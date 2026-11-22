@@ -56,6 +56,8 @@ pub fn routes(state: AppState) -> Router<AppState> {
         .route("/hosts/{id}/rename", post(rename_host))
         .route("/hosts/{id}/notify", get(notify_page))
         .route("/hosts/{id}/notify/test", post(notify_test))
+        .route("/icon.png", get(icon))
+        .route("/go", get(go_page))
         .route("/account", get(account_page).post(account_submit))
         .route("/admin/users", get(users_page).post(create_user))
         .route("/admin/users/{id}/{action}", post(user_action))
@@ -978,4 +980,56 @@ async fn notify_test(
         ));
     }
     Ok(Redirect::to(&format!("/hosts/{id}/notify?ok=sent")).into_response())
+}
+
+const ICON: &[u8] = include_bytes!("../assets/icon.png");
+
+/// The icon Bark and ntfy show beside notifications.
+async fn icon() -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "image/png"),
+            (header::CACHE_CONTROL, "public, max-age=86400"),
+        ],
+        ICON,
+    )
+        .into_response()
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct GoQuery {
+    user: String,
+    computer: String,
+    session: String,
+}
+
+/// `{{goto_url}}`: a web page that opens a session in Runner Remote, for
+/// apps that only open https links. It holds nothing but the link.
+async fn go_page(State(state): State<AppState>, Query(q): Query<GoQuery>) -> Response {
+    let clean = |text: &str, max: usize| -> String {
+        text.chars()
+            .filter(|c| c.is_ascii_alphanumeric() || "-_.@".contains(*c))
+            .take(max)
+            .collect()
+    };
+    let user = clean(&q.user, 64);
+    let session = clean(&q.session, 128);
+    let target = q
+        .computer
+        .parse::<i64>()
+        .ok()
+        .map(|c| (c, Some(session.as_str()).filter(|s| !s.is_empty())));
+    let link = notify::app_link(&state.config.origin, &user, target);
+    let body = format!(
+        r#"<div class="card"><h1>在 Runner Remote 中打开</h1>
+<p class="muted">正在打开 Runner Remote。没有自动打开时，点下面的按钮；这台设备需要已安装 Runner Remote。</p>
+<p><a href="{link}"><button class="primary">打开会话</button></a></p></div>
+<script>location.href={json};</script>"#,
+        link = e(&link),
+        json = serde_json::to_string(&link)
+            .unwrap_or_default()
+            .replace('<', "\\u003c"),
+    );
+    page("打开会话", None, None, &body).into_response()
 }

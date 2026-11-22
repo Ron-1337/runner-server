@@ -413,7 +413,7 @@ impl Watch {
         };
         let message = notify::Message {
             title: notify::TITLE.into(),
-            body: format!("[{}]:{}", event.label(), title),
+            body: format!("{}:{}", event.label(), title),
             url: Some(notify::app_link(
                 &self.state.config.origin,
                 &self.username,

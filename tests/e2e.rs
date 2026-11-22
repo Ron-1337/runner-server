@@ -871,6 +871,38 @@ async fn hosts_notify_the_phone_that_opened_a_channel_through_bark() {
     assert_eq!(test["device_key"], "phone-key");
     assert_eq!(test["level"], "timeSensitive");
     assert_eq!(test["title"], "Runner Remote");
+    assert_eq!(test["icon"], format!("{}/icon.png", s.origin));
+
+    // Every page shows the version; the icon and the web link into the app are public.
+    assert!(
+        page.contains(&format!("v{}", env!("CARGO_PKG_VERSION"))),
+        "{page}"
+    );
+    let icon = reqwest::get(format!("{}/icon.png", s.origin))
+        .await
+        .unwrap();
+    assert_eq!(icon.headers()["content-type"], "image/png");
+    assert!(icon.bytes().await.unwrap().starts_with(b"\x89PNG"));
+    let go = reqwest::get(format!(
+        "{}/go?user=alice&computer={pc_id}&session=s1",
+        s.origin
+    ))
+    .await
+    .unwrap()
+    .text()
+    .await
+    .unwrap();
+    assert!(
+        go.contains(&format!(
+            "runner-remote://open?server={}",
+            url::form_urlencoded::byte_serialize(s.origin.as_bytes()).collect::<String>()
+        )),
+        "{go}"
+    );
+    assert!(
+        go.contains(&format!("computer={pc_id}&amp;session=s1")),
+        "{go}"
+    );
 
     // channelOpen names the device behind the channel.
     let _client = s
@@ -1188,7 +1220,7 @@ async fn the_service_watches_sessions_and_notifies_the_phone_that_took_them_over
     assert_eq!(auth, "Bearer tk");
     assert_eq!(body["topic"], "first");
     assert_eq!(body["title"], "Runner Remote");
-    assert_eq!(body["message"], "[需要输入]:Fix the build");
+    assert_eq!(body["message"], "需要输入:Fix the build");
     assert!(body["click"].as_str().unwrap().contains("session=s1"));
 
     push_tx
@@ -1197,7 +1229,7 @@ async fn the_service_watches_sessions_and_notifies_the_phone_that_took_them_over
     let (_, body) = timeout(WAIT, hooks.recv()).await.unwrap().unwrap();
     let body: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(body["topic"], "second");
-    assert_eq!(body["message"], "[已完成]:Docs");
+    assert_eq!(body["message"], "已完成:Docs");
 
     // A phone that turned "failed" off is not told.
     let saved = s
@@ -1215,7 +1247,7 @@ async fn the_service_watches_sessions_and_notifies_the_phone_that_took_them_over
         .send(json!({"type": "status", "session": "s1", "status": "needsYou", "reason": "answer", "unread": false}))
         .unwrap();
     let (_, body) = timeout(WAIT, hooks.recv()).await.unwrap().unwrap();
-    assert_eq!(body, r#"{"text":"[需要输入]:Fix the build"}"#);
+    assert_eq!(body, r#"{"text":"需要输入:Fix the build"}"#);
 
     let unpaired = s
         .call(

@@ -149,6 +149,8 @@ pub struct Webhook {
     /// The request body with `{{title}}`-style placeholders; empty for the
     /// default JSON.
     pub template: String,
+    /// `{{group}}`; empty for "Runner Remote".
+    pub group: String,
 }
 
 const MAX_HEADERS: usize = 16;
@@ -180,6 +182,7 @@ impl Webhook {
         if self.template.chars().count() > MAX_TEMPLATE {
             return Err("消息模板太长");
         }
+        self.group = clip(self.group.trim(), 64);
         Ok(self)
     }
 }
@@ -304,6 +307,109 @@ pub fn app_link(origin: &str, username: &str, target: Option<(i64, Option<&str>)
     url.into()
 }
 
+/// The icon pushed with every notification, served by this service.
+pub fn icon_url(origin: &str) -> String {
+    format!("{origin}/icon.png")
+}
+
+/// The HTTPS page on this service that forwards to [app_link], for places
+/// that only open web links (chat apps, mail).
+pub fn goto_url(app_link: &str) -> Option<String> {
+    let url = url::Url::parse(app_link).ok()?;
+    let server = url
+        .query_pairs()
+        .find(|(k, _)| k == "server")?
+        .1
+        .into_owned();
+    Some(format!("{server}/go?{}", url.query().unwrap_or_default()))
+}
+
+/// The server a notification's app link names.
+fn origin_of(app_link: &str) -> Option<String> {
+    let url = url::Url::parse(app_link).ok()?;
+    url.query_pairs()
+        .find(|(k, _)| k == "server")
+        .map(|(_, v)| v.into_owned())
+}
+
+/// What an event key is called in notifications.
+pub fn event_name(event: &str) -> &'static str {
+    match event {
+        "input" => "需要输入",
+        "finished" => "已完成",
+        "failed" => "失败",
+        "test" => "测试",
+        _ => "通知",
+    }
+}
+
+/// The values a webhook template may use, as `{{name}}`.
+pub const TEMPLATE_VARIABLES: &[(&str, &str)] = &[
+    ("title", "标题，Runner Remote"),
+    ("message", "内容，例如 需要输入:修复登录"),
+    ("body", "同 message"),
+    ("event", "事件：input、finished、failed、test 或 host"),
+    ("event_name", "事件名：需要输入、已完成、失败、测试"),
+    ("session", "会话名"),
+    ("session_id", "会话 ID"),
+    ("computer", "电脑名"),
+    ("computer_id", "电脑 ID"),
+    ("group", "分组"),
+    ("icon_url", "图标地址"),
+    (
+        "goto_url",
+        "网页跳转链接：https 页面，打开后转到 App 中的会话",
+    ),
+    (
+        "goto_url_schema",
+        "直接跳转链接：runner-remote://…，直接打开 App 中的会话",
+    ),
+    ("url", "同 goto_url_schema"),
+    ("date", "日期，例如 2026-11-22"),
+    ("time", "时间，例如 14:05:09"),
+    ("datetime", "日期和时间"),
+    ("timestamp", "Unix 时间戳（秒）"),
+];
+
+/// The values of [TEMPLATE_VARIABLES] for [message], at [now].
+pub fn variables(
+    message: &Message,
+    group: &str,
+    now: chrono::DateTime<chrono::Local>,
+) -> Vec<(&'static str, String)> {
+    let c = &message.context;
+    let app = message.url.clone().unwrap_or_default();
+    let origin = origin_of(&app).unwrap_or_default();
+    let group = if group.is_empty() { TITLE } else { group };
+    vec![
+        ("title", message.title.clone()),
+        ("message", message.body.clone()),
+        ("body", message.body.clone()),
+        ("event", c.event.clone()),
+        ("event_name", event_name(&c.event).into()),
+        ("session", c.session_title.clone()),
+        ("session_id", c.session.clone()),
+        ("computer", c.computer_name.clone()),
+        ("computer_id", c.computer.clone()),
+        ("group", group.into()),
+        (
+            "icon_url",
+            if origin.is_empty() {
+                String::new()
+            } else {
+                icon_url(&origin)
+            },
+        ),
+        ("goto_url", goto_url(&app).unwrap_or_default()),
+        ("goto_url_schema", app.clone()),
+        ("url", app),
+        ("date", now.format("%Y-%m-%d").to_string()),
+        ("time", now.format("%H:%M:%S").to_string()),
+        ("datetime", now.format("%Y-%m-%d %H:%M:%S").to_string()),
+        ("timestamp", now.timestamp().to_string()),
+    ]
+}
+
 #[derive(Clone)]
 pub struct Notifier {
     http: reqwest::Client,
@@ -334,6 +440,8 @@ struct BarkPush<'a> {
     sound: &'a str,
     #[serde(skip_serializing_if = "str::is_empty")]
     level: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    icon: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -374,6 +482,9 @@ impl Notifier {
         }
         if let Some(url) = &message.url {
             push["click"] = url.as_str().into();
+            if let Some(origin) = origin_of(url) {
+                push["icon"] = icon_url(&origin).into();
+            }
         }
         let mut request = self.http.post(&ntfy.server).json(&push);
         if !ntfy.token.is_empty() {
@@ -392,31 +503,16 @@ impl Notifier {
     }
 
     async fn webhook(&self, hook: &Webhook, message: &Message) -> Result<()> {
-        let c = &message.context;
-        let url = message.url.as_deref().unwrap_or_default();
+        let values = variables(message, &hook.group, chrono::Local::now());
         let body = if hook.template.trim().is_empty() {
-            serde_json::to_string(&serde_json::json!({
-                "title": message.title,
-                "body": message.body,
-                "event": c.event,
-                "url": message.url,
-                "computer": c.computer,
-                "computerName": c.computer_name,
-                "session": c.session,
-                "sessionTitle": c.session_title,
-            }))?
+            let mut json = serde_json::Map::new();
+            for (name, value) in &values {
+                json.insert(camel(name), value.clone().into());
+            }
+            serde_json::to_string(&json)?
         } else {
-            render(
-                &hook.template,
-                &[
-                    ("title", &message.title),
-                    ("body", &message.body),
-                    ("url", url),
-                    ("event", &c.event),
-                    ("session", &c.session_title),
-                    ("computer", &c.computer_name),
-                ],
-            )
+            let values: Vec<(&str, &str)> = values.iter().map(|(n, v)| (*n, v.as_str())).collect();
+            render(&hook.template, &values)
         };
         let mut request = self.http.post(&hook.url).body(body);
         let mut typed = false;
@@ -446,9 +542,18 @@ impl Notifier {
                 &message.body
             },
             url: message.url.as_deref(),
-            group: &bark.group,
+            group: if bark.group.is_empty() {
+                TITLE
+            } else {
+                &bark.group
+            },
             sound: &bark.sound,
             level: &bark.level,
+            icon: message
+                .url
+                .as_deref()
+                .and_then(origin_of)
+                .map(|o| icon_url(&o)),
         };
         let response = self
             .http
@@ -478,6 +583,23 @@ pub fn test_message(origin: &str, username: &str, phone: &str) -> Message {
             ..Context::default()
         },
     }
+}
+
+/// `event_name` → `eventName`, for the default webhook JSON.
+fn camel(name: &str) -> String {
+    let mut out = String::new();
+    let mut upper = false;
+    for c in name.chars() {
+        if c == '_' {
+            upper = true;
+        } else if upper {
+            out.extend(c.to_uppercase());
+            upper = false;
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Fills `{{name}}` placeholders in a webhook template. Values are escaped as
@@ -541,6 +663,53 @@ mod tests {
             r#"{"text":"Runner Remote: [已完成]:say \"hi\"\n","x":"{{missing}}"}"#
         );
         serde_json::from_str::<serde_json::Value>(&out).unwrap();
+    }
+
+    #[test]
+    fn webhooks_get_every_variable() {
+        use chrono::TimeZone;
+        let message = Message {
+            title: TITLE.into(),
+            body: "需要输入:Fix login".into(),
+            url: Some(app_link(
+                "https://r.example.com",
+                "alice",
+                Some((42, Some("s1"))),
+            )),
+            context: Context {
+                event: "input".into(),
+                computer: "42".into(),
+                computer_name: "studio".into(),
+                session: "s1".into(),
+                session_title: "Fix login".into(),
+            },
+        };
+        let now = chrono::Local
+            .with_ymd_and_hms(2026, 11, 22, 14, 5, 9)
+            .unwrap();
+        let values: std::collections::HashMap<_, _> =
+            variables(&message, "", now).into_iter().collect();
+        assert_eq!(
+            values
+                .keys()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>(),
+            TEMPLATE_VARIABLES.iter().map(|(n, _)| *n).collect()
+        );
+        assert_eq!(values["message"], "需要输入:Fix login");
+        assert_eq!(values["event_name"], "需要输入");
+        assert_eq!(values["group"], "Runner Remote");
+        assert_eq!(values["icon_url"], "https://r.example.com/icon.png");
+        assert_eq!(
+            values["goto_url"],
+            "https://r.example.com/go?server=https%3A%2F%2Fr.example.com&user=alice&computer=42&session=s1"
+        );
+        assert!(values["goto_url_schema"].starts_with("runner-remote://open?"));
+        assert_eq!(
+            (values["date"].as_str(), values["time"].as_str()),
+            ("2026-11-22", "14:05:09")
+        );
+        assert_eq!(camel("icon_url"), "iconUrl");
     }
 
     #[test]

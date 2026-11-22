@@ -16,7 +16,8 @@ runner remote login --server https://runner.example.com
 - 每个用户只能看到和连接自己账号下的电脑。
 - “设备管理”：分别列出电脑和手机，查看在线状态和指纹，改名或移除设备。
 - 手机通知：在 Runner Remote App 的“设置 → 通知”里选择推送方式（Bark、ntfy 或自定义 Webhook）和通知类型（需要输入、已完成、失败），可发送测试通知；网页的“通知设置”只显示当前方式并可发送测试。
-- 会话监听：在 App 的“设置 → 通知 → 服务器监听”里，用电脑上 `runner remote pin` 显示的 PIN 让本服务以“Runner Remote 通知服务”的身份与电脑配对。电脑在线时，本服务保持一条只读的加密通道，只发送 `hello`、`overview` 和 `ping`，不输入也不接管。会话变为需要输入、完成（仅普通对话）或失败时推送，标题为 `Runner Remote`，内容为 `[需要输入]:会话名`、`[已完成]:会话名` 或 `[失败]:会话名`；Shell 会话不通知，每台电脑每分钟最多 30 条。通知只发给最后接管这个会话的手机（App 接管时上报 `ClaimSession`），没有人接管时发给最后连接这台电脑的手机。点开通知会用 `runner-remote://` 链接在 Runner Remote 中打开这个会话。配对密钥保存在服务的数据库中，可随时在 App 中取消配对，或在电脑上撤销这个设备。
+- Webhook 消息模板可用变量：`{{title}}`、`{{message}}`（同 `{{body}}`）、`{{event}}`、`{{event_name}}`、`{{session}}`、`{{session_id}}`、`{{computer}}`、`{{computer_id}}`、`{{group}}`、`{{icon_url}}`、`{{goto_url}}`（网页跳转：https 页面 `/go`，打开后转到 App 中的会话，适合聊天软件等只能打开网页链接的地方）、`{{goto_url_schema}}`（直接跳转：`runner-remote://` 链接，直接打开 App）、`{{date}}`、`{{time}}`、`{{datetime}}`、`{{timestamp}}`。值按 JSON 字符串转义；日期时间按服务器时区（可用 `TZ` 环境变量设置）。模板留空时发送包含以上全部字段（驼峰命名）的 JSON。
+- 会话监听：在 App 的“设置 → 通知 → 服务器监听”里，用电脑上 `runner remote pin` 显示的 PIN 让本服务以“Runner Remote 通知服务”的身份与电脑配对。电脑在线时，本服务保持一条只读的加密通道，只发送 `hello`、`overview` 和 `ping`，不输入也不接管。会话变为需要输入、完成（仅普通对话）或失败时推送，标题为 `Runner Remote`，内容为 `需要输入:会话名`、`已完成:会话名` 或 `失败:会话名`，并带上服务的图标（`/icon.png`）；Shell 会话不通知，每台电脑每分钟最多 30 条。通知只发给最后接管这个会话的手机（App 接管时上报 `ClaimSession`），没有人接管时发给最后连接这台电脑的手机。点开通知会用 `runner-remote://` 链接在 Runner Remote 中打开这个会话。配对密钥保存在服务的数据库中，可随时在 App 中取消配对，或在电脑上撤销这个设备。
 
 ## 构建
 
