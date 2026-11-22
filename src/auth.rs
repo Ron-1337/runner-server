@@ -50,8 +50,14 @@ pub fn random_token() -> String {
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
+/// A computer's credential, which Runner checks is `rhc_` and 43 characters.
 pub fn credential() -> String {
     format!("rhc_{}", random_token())
+}
+
+/// A phone's credential, `rcc_` as the official service issues to clients.
+pub fn client_credential() -> String {
+    format!("rcc_{}", random_token())
 }
 
 pub fn sha256_hex(value: &str) -> String {
@@ -193,7 +199,7 @@ pub fn clear_cookie(secure: bool) -> String {
 pub fn bearer(headers: &HeaderMap) -> Option<String> {
     let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
     let token = value.strip_prefix("Bearer ")?.trim();
-    crate::protocol::valid_credential(token).then(|| token.to_owned())
+    crate::protocol::valid_bearer(token).then(|| token.to_owned())
 }
 
 /// The address a request came from, for display only. Forwarding headers count

@@ -140,7 +140,7 @@ impl Server {
 
         let issued = poll(start.device_code.0.clone()).await;
         assert_eq!(issued.state, EnrollmentState::Approved);
-        assert!(remote::valid_credential(&issued.credential.0));
+        assert!(remote::valid_bearer(&issued.credential.0));
         assert!(remote::valid_relay_url(&self.origin, &issued.relay_url));
         assert!(issued.account.is_some());
         assert!(
@@ -1264,6 +1264,117 @@ async fn the_service_watches_sessions_and_notifies_the_phone_that_took_them_over
         .await
         .unwrap();
     assert_eq!(listed["watchers"][0]["paired"], false);
+}
+
+/// The official Runner phone app, as captured against the official service:
+/// a client enrollment without a host key, approved in the phone's browser,
+/// then an `rcc_` credential for the computer list and the relay.
+#[tokio::test]
+async fn the_official_phone_app_enrolls_without_a_key() {
+    let s = server().await;
+    let admin = browser();
+    s.setup(&admin).await;
+    let (pc_id, pc_cred) = s.enroll(&admin, "studio", 1).await;
+    let (mut host, _) = s.host(&pc_cred).await;
+    let request = json!({"kind": "ENROLLMENT_KIND_CLIENT", "client": {"platform": "ios", "runnerVersion": "0.1.0", "osVersion": "27.0", "name": "iPhone"}});
+    let start: Value = s
+        .call("HostEnrollmentService/StartEnrollment", None, request)
+        .await
+        .json()
+        .await
+        .unwrap();
+    let code = start["userCode"]
+        .as_str()
+        .expect("enrollment starts")
+        .to_owned();
+    let poll = || async {
+        s.call(
+            "HostEnrollmentService/PollEnrollment",
+            None,
+            json!({"deviceCode": start["deviceCode"]}),
+        )
+        .await
+        .json::<Value>()
+        .await
+        .unwrap()
+    };
+    assert_eq!(poll().await["state"], "ENROLLMENT_STATE_PENDING");
+    // Nothing is approved until the person approves it.
+    let page = admin
+        .get(format!("{}/hosts/add?code={code}", s.origin))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(page.contains("批准这部手机"), "{page}");
+    assert_eq!(poll().await["state"], "ENROLLMENT_STATE_PENDING");
+    s.form(
+        &admin,
+        "/hosts/add",
+        &[("code", &code), ("decision", "approve")],
+    )
+    .await;
+    let issued = poll().await;
+    assert_eq!(issued["state"], "ENROLLMENT_STATE_APPROVED");
+    let credential = issued["credential"].as_str().unwrap().to_owned();
+    assert!(credential.starts_with("rcc_"), "{credential}");
+    assert!(!issued["clientId"].as_str().unwrap().is_empty());
+    assert_eq!(s.host_ids(&credential).await, vec![pc_id.clone()]);
+    let _route = s
+        .ws(
+            &format!("/relay/client?host={pc_id}"),
+            &credential,
+            remote::CLIENT_SUBPROTOCOL,
+        )
+        .await
+        .unwrap();
+    assert_eq!(text(&mut host).await["type"], "channelOpen");
+
+    // A second keyless phone does not replace the first.
+    let again =
+        json!({"kind": "ENROLLMENT_KIND_CLIENT", "client": {"platform": "ios", "name": "iPad"}});
+    let start: Value = s
+        .call("HostEnrollmentService/StartEnrollment", None, again)
+        .await
+        .json()
+        .await
+        .unwrap();
+    s.form(
+        &admin,
+        "/hosts/add",
+        &[
+            ("code", start["userCode"].as_str().unwrap()),
+            ("decision", "approve"),
+        ],
+    )
+    .await;
+    let second: Value = s
+        .call(
+            "HostEnrollmentService/PollEnrollment",
+            None,
+            json!({"deviceCode": start["deviceCode"]}),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(second["state"], "ENROLLMENT_STATE_APPROVED");
+    assert_eq!(
+        s.host_ids(&credential).await,
+        vec![pc_id],
+        "the first phone still works"
+    );
+    // A computer still needs its key.
+    let keyless = s
+        .call(
+            "HostEnrollmentService/StartEnrollment",
+            None,
+            json!({"host": {"hostname": "x"}}),
+        )
+        .await;
+    assert_eq!(keyless.status(), 400);
 }
 
 #[tokio::test]

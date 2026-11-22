@@ -123,7 +123,10 @@ async fn start(
     body: Bytes,
 ) -> RpcResult<StartResponse> {
     let request: StartRequest = parse(&body)?;
-    if decode_host_key(&request.host_key).is_none() {
+    // The official phone app enrolls as a client without a key: its channels
+    // are keyed by pairing with each computer, not by the account.
+    let keyless_client = request.kind == DeviceKind::Phone && request.host_key.is_empty();
+    if !keyless_client && decode_host_key(&request.host_key).is_none() {
         return Err(RpcError::invalid(
             "hostKey must be a base64 32-byte public key.",
         ));
@@ -223,7 +226,11 @@ async fn poll(State(state): State<AppState>, body: Bytes) -> RpcResult<PollRespo
                         match user {
                             None => Polled::State(EnrollmentState::Denied),
                             Some(user) => {
-                                let replaced = db::host_ids_with_key(&tx, &e.host_key)?;
+                                let replaced = if e.host_key.is_empty() {
+                                    Vec::new()
+                                } else {
+                                    db::host_ids_with_key(&tx, &e.host_key)?
+                                };
                                 for id in &replaced {
                                     db::delete_host(&tx, *id, None)?;
                                 }
@@ -233,7 +240,10 @@ async fn poll(State(state): State<AppState>, body: Bytes) -> RpcResult<PollRespo
                                         break id;
                                     }
                                 };
-                                let credential = auth::credential();
+                                let credential = match e.kind {
+                                    DeviceKind::Phone => auth::client_credential(),
+                                    DeviceKind::Computer => auth::credential(),
+                                };
                                 let key = decode_host_key(&e.host_key).unwrap_or_default();
                                 let name = if !e.name.is_empty() {
                                     e.name.clone()

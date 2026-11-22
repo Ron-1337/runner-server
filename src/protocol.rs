@@ -298,6 +298,15 @@ pub fn decode_key(encoded: &str) -> Option<Vec<u8>> {
     STANDARD.decode(encoded).ok().filter(|k| k.len() == 32)
 }
 
+/// A bearer credential: a computer's `rhc_` or a phone's `rcc_` (phones
+/// enrolled before 0.1.3 hold `rhc_` ones, which keep working).
+pub fn valid_bearer(value: &str) -> bool {
+    valid_credential(value)
+        || value
+            .strip_prefix("rcc_")
+            .is_some_and(|token| valid_credential(&format!("rhc_{token}")))
+}
+
 /// Runner rejects an enrollment credential that is not `rhc_` and 43 URL-safe characters.
 pub fn valid_credential(value: &str) -> bool {
     value.strip_prefix("rhc_").is_some_and(|token| {
